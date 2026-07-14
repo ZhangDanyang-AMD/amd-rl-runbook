@@ -669,3 +669,207 @@ pr-1411
 ```
 
 The image's preinstalled ATOM did not support this per-block fp8 path in the original test; the editable install from this PR is required.
+
+---
+
+# Reproducing the no-eager online-weight-update degeneration (correctness bug)
+
+The throughput comparison above uses `ignore_eos=True`, so every request emits
+exactly `max_tokens` regardless of quality — it **cannot** surface the correctness
+bug. This section reproduces the actual failure seen in RL:
+
+> With `enforce_eager=false` + `compilation level=3`, ATOM per-block-FP8 captures a
+> CUDA graph at init. An **online weight update** (the RL rollout weight sync: push
+> BF16 weights → re-quantize to per-block FP8 in place, `AsyncLLMEngine.load_weights`)
+> is **not correctly reflected by the replayed graph**. Decode then degenerates:
+> every request runs to `max_tokens`, never emits EOS (in RL: `Rollout reward
+> accuracy=0.0000`, `filter_groups kept 0/N`, `finished with reason max` only).
+> Eager (no captured graph) is unaffected. This is a *different* bug from the
+> sleep/wake KV-pool collapse — disabling sleep does NOT fix it.
+
+It reproduces on a fresh machine with the **base model only** (no RL checkpoint):
+the "updated" weights are synthesized as `base + per-tensor Gaussian noise` (a
+genuine non-uniform change; a uniform scale would not work because greedy argmax
+is scale-invariant).
+
+## Quick Start (reuses the container/ATOM/model from the section above)
+
+Create `repro_noeager_update.py`:
+
+```bash
+cat > repro_noeager_update.py <<'PY'
+#!/usr/bin/env python3
+"""Portable reproduction of ATOM per-block-FP8 no-eager+level3 online-update degeneration."""
+from __future__ import annotations
+import argparse, glob, json, os
+from collections import Counter
+from statistics import mean
+from typing import Any
+
+QUESTIONS = [
+    "Let a,b,c be positive reals with a+b+c=1. Find the minimum of 1/a+1/b+1/c and prove it. Show every step.",
+    "Find all integer solutions to x^2 - 7y^2 = 1 with 0 < x < 200. Explain the method in full detail.",
+    "A fair die is rolled 10 times. Compute the exact probability the running sum is never divisible by 3. Show all reasoning.",
+    "Prove that there are infinitely many primes of the form 4k+3, giving every logical step.",
+    "Compute sum_{n=1}^{100} n^3 from first principles and derive the closed form, showing the full derivation.",
+    "In triangle ABC the incircle touches BC at D. Given BD=4, DC=6, inradius 3, find the area. Detail every step.",
+    "Solve the recurrence a_{n+1}=3a_n-2a_{n-1} with a_0=1,a_1=3. Give the closed form with full derivation.",
+    "How many ways can you tile a 2xN board with 1x2 dominoes? Derive and prove the formula carefully.",
+]
+
+def build_prompts(model, n):
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+    out = []
+    for q in QUESTIONS[:n]:
+        try:
+            out.append(tok.apply_chat_template([{"role": "user", "content": q}], tokenize=False, add_generation_prompt=True))
+        except Exception:
+            out.append(q)
+    return out
+
+def updated_weights(hf_dir, perturb_std, seed=0):
+    import torch
+    from safetensors import safe_open
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    for f in sorted(glob.glob(os.path.join(hf_dir, "*.safetensors"))):
+        with safe_open(f, framework="pt", device="cuda") as sf:
+            for name in sf.keys():
+                t = sf.get_tensor(name).to(torch.bfloat16)
+                if perturb_std > 0 and t.dtype.is_floating_point and t.dim() >= 2:
+                    noise = torch.randn(t.shape, generator=g, device="cuda", dtype=torch.float32)
+                    t = (t.float() + noise * (perturb_std * t.float().std())).to(torch.bfloat16)
+                yield name, t
+
+def stats(recs, max_tokens):
+    lens = [len(r["token_ids"]) for r in recs]
+    reasons = Counter(r["finish_reason"] for r in recs)
+    distinct = [len(set(r["token_ids"])) / len(r["token_ids"]) if r["token_ids"] else 1.0 for r in recs]
+    return {"finish_reasons": dict(reasons), "eos_rate": reasons.get("eos", 0)/len(recs) if recs else 0.0,
+            "hit_max_rate": sum(1 for L in lens if L >= max_tokens)/len(recs) if recs else 0.0,
+            "mean_len": mean(lens) if lens else 0, "mean_distinct_ratio": mean(distinct) if distinct else 1.0}
+
+def recs(outs):
+    return [{"finish_reason": (o or {}).get("finish_reason", "?"),
+             "token_ids": [int(x) for x in (o or {}).get("token_ids", [])]} for o in outs]
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--model", required=True)
+    p.add_argument("--mode", choices=["noeager", "eager"], default="noeager")
+    p.add_argument("--perturb-std", type=float, default=0.03)
+    p.add_argument("--num-prompts", type=int, default=8)
+    p.add_argument("--max-tokens", type=int, default=4096)
+    p.add_argument("--max-model-len", type=int, default=5120)
+    p.add_argument("--max-num-seqs", type=int, default=64)
+    p.add_argument("--gpu-memory-utilization", type=float, default=0.85)
+    p.add_argument("--output", default="repro_noeager_update.json")
+    args = p.parse_args()
+
+    prompts = build_prompts(args.model, args.num_prompts)
+    os.environ.pop("ATOM_DISABLE_VLLM_PLUGIN", None)
+    from atom import SamplingParams
+    from atom.rollout.async_engine import AsyncLLMEngine
+    noeager = args.mode == "noeager"
+    llm = AsyncLLMEngine(
+        model=args.model, tensor_parallel_size=1, gpu_memory_utilization=args.gpu_memory_utilization,
+        max_model_len=args.max_model_len, max_num_batched_tokens=max(8192, args.max_model_len),
+        max_num_seqs=args.max_num_seqs, enforce_eager=(not noeager), trust_remote_code=True,
+        enable_chunked_prefill=True, enable_prefix_caching=False, kv_cache_dtype="bf16",
+        cudagraph_capture_sizes=str([1,2,4,8,16,32,48,64]), level=(3 if noeager else 0),
+        online_quant_config={"global_quant_config": "per_block_fp8"})
+    sp = SamplingParams(max_tokens=args.max_tokens, temperature=0.0, top_p=1.0, top_k=-1, ignore_eos=False)
+
+    before = stats(recs(llm.generate(prompts, sp)), args.max_tokens)
+    print(f"[BEFORE update] {json.dumps(before)}", flush=True)
+    print(f"[update] online load_weights <- {args.model} + noise(std={args.perturb_std})", flush=True)
+    llm.load_weights(updated_weights(args.model, args.perturb_std), bucket_size_mb=2048, num_gpus=1, mode="shm")
+    after = stats(recs(llm.generate(prompts, sp)), args.max_tokens)
+    print(f"[AFTER update]  {json.dumps(after)}", flush=True)
+    try:
+        llm.close()
+    except Exception:
+        pass
+    json.dump({"mode": args.mode, "before": before, "after": after}, open(args.output, "w"), indent=2)
+    reproduced = before["eos_rate"] >= 0.5 and after["eos_rate"] < 0.2 and (after["hit_max_rate"] > 0.8 or after["mean_distinct_ratio"] < 0.1)
+    print(f"\n[RESULT] mode={args.mode} before_eos={before['eos_rate']:.3f} after_eos={after['eos_rate']:.3f}")
+    print("[RESULT]", "REPRODUCED (online update degrades no-eager output)" if reproduced else "healthy (no degeneration)")
+
+if __name__ == "__main__":
+    main()
+PY
+chmod +x repro_noeager_update.py
+```
+
+Run it (assumes `run_repro.sh` from the previous section already cloned ATOM to
+`$WORKDIR/ATOM` and the base model is available at `$MODEL`). The `--mode noeager`
+run reproduces; `--mode eager` is the control:
+
+```bash
+cat > run_noeager_repro.sh <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+WORKDIR="${WORKDIR:-$PWD}"
+DATA_ROOT="${DATA_ROOT:-$WORKDIR/data}"
+IMAGE="${IMAGE:-rocm/atom-dev:vllm-v0.22.0-nightly_20260712}"
+MODEL="${MODEL_PATH:-Qwen/Qwen3-8B-Base}"
+if [ -n "${MODEL_PATH:-}" ]; then MODEL="$(realpath "$MODEL_PATH")"; fi
+
+sudo docker run --rm --name atom-noeager-repro \
+  --network=host --ipc=host --device=/dev/kfd --device=/dev/dri --group-add=video \
+  --cap-add=SYS_PTRACE --security-opt seccomp=unconfined --shm-size 64G \
+  -v "$WORKDIR":"$WORKDIR" -v "$DATA_ROOT":"$DATA_ROOT" \
+  $([ -n "${MODEL_PATH:-}" ] && echo -v "$MODEL:$MODEL:ro") \
+  -e HF_HOME="$DATA_ROOT/hf_home" -e HF_HUB_CACHE="$DATA_ROOT/cache/hub" -e HF_TOKEN="${HF_TOKEN:-}" \
+  "$IMAGE" bash -lc "
+set -euo pipefail
+cd '$WORKDIR'
+python3 -m pip install -e '$WORKDIR/ATOM' --no-deps
+export PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=false
+export HIP_FORCE_DEV_KERNARG=1 HSA_NO_SCRATCH_RECLAIM=1 HSA_DISABLE_FRAGMENT_ALLOCATOR=1 CUDA_DEVICE_MAX_CONNECTIONS=1
+export VLLM_USE_V1=1 VLLM_LOGGING_LEVEL=WARN
+# level=3 needs dynamo enabled; give each engine an isolated compile cache
+export TORCHDYNAMO_DISABLE=0 ATOM_ISOLATE_TORCH_COMPILE_CACHE=1 ATOM_TORCH_COMPILE_CACHE_ROOT=/tmp/atom_torch_compile_cache
+export PYTHONPATH='$WORKDIR/ATOM'
+echo '=== no-eager + level3 (expect REPRODUCED) ==='
+python3 -u repro_noeager_update.py --model '$MODEL' --mode noeager --perturb-std 0.03 --output repro_noeager.json
+echo '=== eager control (expect healthy) ==='
+python3 -u repro_noeager_update.py --model '$MODEL' --mode eager   --perturb-std 0.03 --output repro_eager.json
+"
+SH
+chmod +x run_noeager_repro.sh
+./run_noeager_repro.sh
+```
+
+## Expected output
+
+```text
+# --mode noeager (bug):
+[BEFORE update] {... "eos_rate": 1.0,  "hit_max_rate": 0.0, "mean_len": ~834 ...}
+[AFTER update]  {... "eos_rate": 0.0,  "hit_max_rate": 1.0, "mean_len": 4096, "mean_distinct_ratio": 0.0 ...}
+[RESULT] mode=noeager before_eos=1.000 after_eos=0.000
+[RESULT] REPRODUCED (online update degrades no-eager output)
+
+# --mode eager (control): healthy before AND after
+[RESULT] mode=eager  before_eos≈1.000 after_eos≈1.000
+[RESULT] healthy (no degeneration)
+```
+
+The signature: **before** the online update the captured graph is correct
+(EOS-terminated); **after** `load_weights` the no-eager output collapses to
+all-`max_tokens` / zero distinct tokens, while the eager control stays healthy —
+proving the captured CUDA graph, not the weights themselves, is the defect.
+
+## Notes / scope
+
+- Reproduces with the base model alone; no RL checkpoint needed (`--perturb-std`
+  synthesizes the weight change). With a real trained checkpoint, replace
+  `--perturb-std` by loading that checkpoint's safetensors in `updated_weights`.
+- `--mode eager` is the control and the current known-good RL setting.
+- Root-cause fix belongs in ATOM: after an online weight update, the no-eager
+  engine must re-capture (or invalidate) the CUDA graph so the replayed graph uses
+  the re-quantized FP8 weights/scales. Until then, run the ATOM FP8 rollout with
+  `enforce_eager=true`.
+- Separately, if you keep `sleep`/`wake` with no-eager, the KV pool re-sizes on
+  wake (block count collapse, e.g. `12601 -> 1197`) and decode hits a HIP illegal
+  memory access; keep KV resident (do not release KV on sleep) to avoid that.
