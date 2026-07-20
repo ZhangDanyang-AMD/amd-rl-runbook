@@ -53,8 +53,8 @@
 ## 2. 路径变量（所有后续命令都用这三个变量，换机只改这里）
 
 ```bash
-export RL_ROOT=$HOME/xysheng/lumen_rl      # 代码根（内含 Lumen-RL / Lumen / aiter + 启动脚本）
-export DATA_ROOT=$HOME/xysheng/data        # 模型 / 数据 / 日志 / ckpt 根
+export RL_ROOT=/path/to/lumen_rl      # 代码根（内含 Lumen-RL / Lumen / aiter + 启动脚本）
+export DATA_ROOT=/path/to/data        # 模型 / 数据 / 日志 / ckpt 根
 export CONTAINER=rl-vllm-fsdp
 mkdir -p "$RL_ROOT" "$DATA_ROOT/logs"
 ```
@@ -67,10 +67,10 @@ mkdir -p "$RL_ROOT" "$DATA_ROOT/logs"
 
 ```bash
 cd "$RL_ROOT"
-git clone -b dev/vllm-fsdp-dapo   git@github.com:ZhangDanyang-AMD/Lumen-RL.git
-git clone -b amd-atom-rollout     git@github.com:ZhangDanyang-AMD/Lumen.git
-git clone -b lumen/triton_kernels git@github.com:ZhangDanyang-AMD/aiter.git
-git clone -b lumen-rl             git@github.com:xysheng-AMD/ATOM.git   # 仅 MODE=atomfp8（ATOM rollout）需要
+git clone -b dev/vllm-fsdp-dapo   https://github.com/ZhangDanyang-AMD/Lumen-RL.git
+git clone -b amd-atom-rollout     https://github.com/ZhangDanyang-AMD/Lumen.git
+git clone -b lumen/triton_kernels https://github.com/ZhangDanyang-AMD/aiter.git
+git clone -b lumen-rl             https://github.com/xysheng-AMD/ATOM.git   # 仅 MODE=atomfp8（ATOM rollout）需要
 
 # aiter 的 JIT 依赖 composable_kernel；必须补齐，否则 ATOM / FP8 触发
 # module_rmsnorm 时会找不到 3rdparty/composable_kernel/.../generate.py。
