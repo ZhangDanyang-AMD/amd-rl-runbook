@@ -61,15 +61,42 @@ mkdir -p "$RL_ROOT" "$DATA_ROOT/logs"
 
 ---
 
-## 3. 拉取代码（仓库各自分支，不用 submodule）
+## 3. 拉取代码（仓库各自分支；`aiter` 需要 submodule）
+
+默认非国内网络直接从 GitHub 拉取：
 
 ```bash
 cd "$RL_ROOT"
-git clone -b dev/vllm-fsdp-dapo   https://github.com/ZhangDanyang-AMD/Lumen-RL.git
-git clone -b amd-atom-rollout     https://github.com/ZhangDanyang-AMD/Lumen.git
-git clone -b lumen/triton_kernels https://github.com/ZhangDanyang-AMD/aiter.git
-git clone -b lumen-rl             https://github.com/xysheng-AMD/ATOM.git   # 仅 MODE=atomfp8（ATOM rollout）需要
+git clone -b dev/vllm-fsdp-dapo   git@github.com:ZhangDanyang-AMD/Lumen-RL.git
+git clone -b amd-atom-rollout     git@github.com:ZhangDanyang-AMD/Lumen.git
+git clone -b lumen/triton_kernels git@github.com:ZhangDanyang-AMD/aiter.git
+git clone -b lumen-rl             git@github.com:xysheng-AMD/ATOM.git   # 仅 MODE=atomfp8（ATOM rollout）需要
+
+# aiter 的 JIT 依赖 composable_kernel；必须补齐，否则 ATOM / FP8 触发
+# module_rmsnorm 时会找不到 3rdparty/composable_kernel/.../generate.py。
+cd "$RL_ROOT/aiter"
+git submodule update --init --depth 1 3rdparty/composable_kernel
 ```
+
+中国内网机器如果 GitHub 直连不稳定，可只对本次命令使用代理镜像（不要写死进仓库 remote）：
+
+```bash
+cd "$RL_ROOT"
+GHP=https://gh-proxy.com/https://github.com
+git -c http.version=HTTP/1.1 clone --depth 1 --single-branch -b dev/vllm-fsdp-dapo   "$GHP/ZhangDanyang-AMD/Lumen-RL.git"
+git -c http.version=HTTP/1.1 clone --depth 1 --single-branch -b amd-atom-rollout     "$GHP/ZhangDanyang-AMD/Lumen.git"
+git -c http.version=HTTP/1.1 clone --depth 1 --single-branch -b lumen/triton_kernels "$GHP/ZhangDanyang-AMD/aiter.git"
+git -c http.version=HTTP/1.1 clone --depth 1 --single-branch -b lumen-rl             "$GHP/xysheng-AMD/ATOM.git"
+
+cd "$RL_ROOT/aiter"
+git -c http.version=HTTP/1.1 \
+  -c url."$GHP/".insteadOf=https://github.com/ \
+  submodule update --init --depth 1 3rdparty/composable_kernel
+```
+
+> 容器内用 root 访问宿主挂载仓库时，`pip install -e` / `setuptools_scm` 可能遇到
+> `fatal: detected dubious ownership`。这类一次性实验机器可以在容器内设置全局
+> `safe.directory`（见第 5 节）；若是共享机器，也可改用临时 `GIT_CONFIG_GLOBAL`。
 
 | 仓库 | 分支 | 用途 |
 |---|---|---|
@@ -81,6 +108,23 @@ git clone -b lumen-rl             https://github.com/xysheng-AMD/ATOM.git   # �
 ---
 
 ## 4. 启动 Docker（把 `$RL_ROOT/$DATA_ROOT` 及派生变量注入容器）
+
+非国内网络直接拉官方镜像：
+
+```bash
+sudo docker pull vllm/vllm-openai-rocm:v0.23.0
+```
+
+中国内网如果 Docker Hub 慢或卡住，可用国内 registry 镜像拉取后重新打本地 tag：
+
+```bash
+sudo docker pull docker.m.daocloud.io/vllm/vllm-openai-rocm:v0.23.0
+sudo docker tag docker.m.daocloud.io/vllm/vllm-openai-rocm:v0.23.0 \
+  vllm/vllm-openai-rocm:v0.23.0
+```
+
+> 启动前务必确认容器内版本是 `vllm 0.23.0`。本机若已有 `vllm/vllm-openai-rocm:latest`
+> 不代表可用，可能是旧版 vLLM。
 
 ```bash
 sudo docker rm -f "$CONTAINER" 2>/dev/null
@@ -103,11 +147,17 @@ sudo docker run -d --name "$CONTAINER" --entrypoint /bin/bash \
 ```bash
 sudo docker exec "$CONTAINER" bash -lc '
 set -e
+# 容器 root 访问宿主挂载仓库时允许 git introspection（editable install / setuptools_scm）。
+git config --global --add safe.directory "$RL_ROOT/Lumen-RL" || true
+git config --global --add safe.directory "$LUMEN_DIR" || true
+git config --global --add safe.directory "$AITER_DIR" || true
+git config --global --add safe.directory "$RL_ROOT/ATOM" || true
 # --- 依赖(不覆盖镜像内 vLLM/torch) ---
 cd "$AITER_DIR" && AITER_USE_SYSTEM_TRITON=1 python3 setup.py develop || pip install -e .
 pip install -e "$LUMEN_DIR" --no-deps || true
 cd "$RL_ROOT/Lumen-RL" && pip install -e . --no-deps
-pip install datasets "math_verify[antlr4_13_2]" omegaconf safetensors
+pip install "ray[default]>=2.9" "accelerate>=0.28" datasets \
+  "math_verify[antlr4_13_2]" "omegaconf>=2.3,<2.4" safetensors
 '
 ```
 > `MODE=atomfp8` 的 ATOM 引擎**无需单独 pip 安装**——`run_dapo.sh` 自动把 `$RL_ROOT/ATOM` 及
@@ -253,7 +303,9 @@ PY
 
 ## 6. 下载模型 / 数据（BF16 与 FP8 都需要）
 
-**6.1 模型 + 原始数据**(模型 Qwen3-8B-Base;数据 = verl DAPO 同款 train/val):
+**6.1 模型 + 原始数据**(模型 Qwen3-8B-Base;数据 = verl DAPO 同款 train/val)。
+
+非国内网络可继续用 Hugging Face：
 ```bash
 sudo docker exec "$CONTAINER" bash -lc '
 python3 - <<PY
@@ -269,6 +321,44 @@ snapshot_download("BytedTsinghua-SIA/AIME-2024", repo_type="dataset",
 PY
 '
 ```
+
+中国内网机器建议使用 ModelScope，避免 HF 慢/断连：
+
+```bash
+sudo docker exec "$CONTAINER" bash -lc '
+pip install modelscope
+python3 - <<PY
+from modelscope.hub.snapshot_download import snapshot_download
+import os
+
+D = os.environ["DATA_ROOT"]
+snapshot_download(
+    "Qwen/Qwen3-8B-Base",
+    local_dir=f"{D}/models/Qwen3-8B-Base",
+    allow_patterns=["*.json", "*.txt", "*.safetensors", "*.model", "tokenizer*", "*.py", "*.tiktoken"],
+    max_workers=8,
+)
+snapshot_download(
+    repo_id="BytedTsinghua-SIA/DAPO-Math-17k",
+    repo_type="dataset",
+    local_dir=f"{D}/raw/DAPO-Math-17k",
+    allow_patterns=["*.parquet", "*.json", "*.jsonl", "*.md", "*.txt"],
+    max_workers=4,
+)
+snapshot_download(
+    repo_id="BytedTsinghua-SIA/AIME-2024",
+    repo_type="dataset",
+    local_dir=f"{D}/raw/AIME-2024",
+    allow_patterns=["*.parquet", "*.json", "*.jsonl", "*.md", "*.txt"],
+    max_workers=4,
+)
+PY
+'
+```
+
+> ModelScope 上已验证 ID：`Qwen/Qwen3-8B-Base`、
+> `BytedTsinghua-SIA/DAPO-Math-17k`、`BytedTsinghua-SIA/AIME-2024`。
+> 下载完成后仍走同一套本地路径，后续过滤与训练命令不需要改。
 
 **6.2 过滤 prompt ≤1024**(复刻 verl `RLHFDataset.maybe_filter_out_long_prompts`;不预过滤则启动会进入
 耗时的 overlong-prompt 扫描)。写出脚本并在容器内运行:
@@ -518,7 +608,7 @@ chmod +x "$RL_ROOT/Lumen-RL/examples/DAPO/run_dapo.sh"
 no-eager level=3 方案固化成可重复命令：
 
 ```bash
-# 4k smoke：默认 3 step、batch=256、gen_batch=48、num_generations=8、no eval/no save。
+# 4k smoke：默认 3 step、batch=64、gen_batch=24、num_generations=8、no eval/no save。
 # 打开 no-eager level=3 时需同时打开 sleep2。
 SMOKE_STEPS=1 \
 TORCHDYNAMO_DISABLE=0 \
@@ -546,20 +636,104 @@ CKPT=$DATA_ROOT/ckpts/lumenrl_native_vllm_fsdp/atomfp8-noeager-level3-8b
 RUN_ID=my-run LONGRUN_STEPS=1000 CKPT=/path/to/ckpt ./scripts/run_atom_fp8_noeager_level3_longrun.sh
 ```
 
+### 8.2 ATOM / AITER 首次 JIT 预编译（训练前做）
+
+`MODE=atomfp8` 使用本地 `ATOM` + 本地 `aiter` 源码，不同于 vLLM wheel 内置 kernel。
+ATOM 启动 Qwen3 FP8 rollout 时会按需 JIT 编译 `aiter` kernel，尤其是：
+
+- `module_rmsnorm`：ATOM `atom/model_ops/layernorm.py` 直接调用本地
+  `aiter.rmsnorm2d_fwd(..., use_model_sensitive_rmsnorm=1)`，首次会编译；
+- `module_gemm_a8w8_blockscale_bpreshuffle`、`module_activation`、`module_sample`、
+  `module_rope_*` / `module_cache` 等：首次 ATOM FP8 rollout 会继续触发。
+
+这些是**环境安装 / 预热成本**，不要把它们算进训练性能。建议在正式 smoke / longrun 前先预编译
+RMSNorm，并让一次 ATOM 小 smoke 完整跑完，把后续常用 JIT 产物也落盘。
+
+```bash
+# 先确认 aiter submodule 已拉取（见第 3 节），否则 module_rmsnorm 会找不到 generate.py。
+test -f "$RL_ROOT/aiter/3rdparty/composable_kernel/example/ck_tile/10_rmsnorm2d/generate.py"
+
+# 单进程预编译 module_rmsnorm。首次可能耗时十几到二十分钟；看到 PRECOMPILE_DONE 才算完成。
+sudo docker exec "$CONTAINER" bash -lc '
+export PYTHONPATH="$AITER_DIR:${PYTHONPATH:-}"
+python3 - <<PY
+import torch
+from aiter import rmsnorm2d_fwd
+print("PRECOMPILE_START", flush=True)
+x = torch.randn((1, 4096), device="cuda", dtype=torch.bfloat16)
+w = torch.ones((4096,), device="cuda", dtype=torch.bfloat16)
+y = rmsnorm2d_fwd(x, w, 1e-6, use_model_sensitive_rmsnorm=1)
+torch.cuda.synchronize()
+print("PRECOMPILE_DONE", y.shape, y.dtype, flush=True)
+PY
+'
+```
+
+若中途被 `Ctrl-C`、容器重启或 `pkill` 打断，可能留下 stale lock，表现为后续进程一直打印
+`waiting for baton release at .../lock_module_rmsnorm`，但没有 `ninja` / `hipcc` / `clang-22`
+编译进程。清理后重跑预编译：
+
+```bash
+sudo docker exec "$CONTAINER" bash -lc '
+rm -rf "$AITER_DIR/aiter/jit/build/lock_module_rmsnorm" \
+       "$AITER_DIR/aiter/jit/build/module_rmsnorm"
+'
+```
+
+> vLLM FP8 rollout 不需要这一步，因为它走镜像内已安装的 vLLM/AITER 路径；ATOM FP8 rollout
+> 走本地 `aiter` 源码 JIT，因此需要预编译。
+
 ---
 
-## 9. Smoke（5 步验证整链路，前台等结果）
+## 9. Smoke（小配置验证整链路，前台等结果）
+
+> ⚠️ Smoke 必须显式使用 `CONFIG_OVERRIDE=..._smoke.yaml` 小配置。只设置 `STEPS=5`
+> 会继续使用 longrun config（resp=20480、batch=512、gen_batch=96），不是快速 smoke。
+> 小配置只用于验证链路；第 10 节长跑仍使用 `run_dapo.sh` 默认 longrun config，不受影响。
+
+| 路线 | smoke config | 规模 |
+|---|---|---|
+| BF16 vLLM | `dapo_qwen3_8b_ray_vllm_smoke.yaml` | resp=512, batch=128, gen_batch=24, generations=16 |
+| vLLM FP8 rollout | `dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml` | resp=512, batch=128, gen_batch=24, generations=16 |
+| vLLM FP8 4k rollout | `dapo_qwen3_8b_ray_vllm_fp8_4k_smoke.yaml` | resp=4096, batch=64, gen_batch=24, generations=8 |
+| ATOM FP8 4k rollout | `dapo_qwen3_8b_ray_atom_fp8_4k_smoke.yaml` | resp=4096, batch=64, gen_batch=24, generations=8, no-eager level=3（由 `MODE=atomfp8` 覆盖） |
+
+推荐先跑三条“链路 smoke”（训练侧保持 BF16，避免把 `TRAIN_FP8=1` 的训练 kernel JIT 混入快速验证）：
 
 ```bash
 S=$RL_ROOT/Lumen-RL/examples/DAPO/run_dapo.sh
 ENVX="export RL_ROOT='$RL_ROOT' DATA_ROOT='$DATA_ROOT';"   # 显式注入，避免容器内 RL_ROOT 为空
-# BF16 smoke
-sudo docker exec "$CONTAINER" bash -lc "$ENVX STEPS=5 MODE=bf16 bash '$S'; tail -40 \"\$(cat /tmp/run_dapo_log.txt)\""
-# FP8 smoke（rollout per_block_fp8；加 TRAIN_FP8=1 连 FP8 训练一起测）
-sudo docker exec "$CONTAINER" bash -lc "$ENVX STEPS=5 MODE=fp8 TRAIN_FP8=1 bash '$S'; tail -40 \"\$(cat /tmp/run_dapo_log.txt)\""
-# ATOM FP8 smoke（rollout=ATOM per_block_fp8；需已 clone ATOM 仓库，见 §3）
-sudo docker exec "$CONTAINER" bash -lc "$ENVX STEPS=5 MODE=atomfp8 TRAIN_FP8=1 bash '$S'; tail -40 \"\$(cat /tmp/run_dapo_log.txt)\""
+
+# BF16 vLLM：512-token 小配置。
+sudo docker exec "$CONTAINER" bash -lc "$ENVX \
+  CONFIG_OVERRIDE=examples/DAPO/configs/dapo_qwen3_8b_ray_vllm_smoke.yaml \
+  STEPS=1 MODE=bf16 LOG=$DATA_ROOT/logs/smoke-bf16-512.log bash '$S'; \
+  tail -80 \"\$(cat /tmp/run_dapo_log.txt)\""
+
+# vLLM FP8 rollout：512-token 小配置；TRAIN_FP8=0 仅验证 rollout fp8_per_block。
+sudo docker exec "$CONTAINER" bash -lc "$ENVX \
+  CONFIG_OVERRIDE=examples/DAPO/configs/dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml \
+  STEPS=1 MODE=fp8 TRAIN_FP8=0 LOG=$DATA_ROOT/logs/smoke-vllm-fp8-512.log bash '$S'; \
+  tail -80 \"\$(cat /tmp/run_dapo_log.txt)\""
+
+# ATOM FP8 rollout：4k 小配置；MODE=atomfp8 会覆盖为 no-eager + compilation_config.level=3 + sleep2。
+# 运行前建议先完成第 8.2 节 AITER JIT 预编译；首次仍可能继续编译 GEMM/activation/sample/rope/cache 等小模块。
+sudo docker exec "$CONTAINER" bash -lc "$ENVX \
+  CONFIG_OVERRIDE=examples/DAPO/configs/dapo_qwen3_8b_ray_atom_fp8_4k_smoke.yaml \
+  STEPS=1 MODE=atomfp8 TRAIN_FP8=0 LOG=$DATA_ROOT/logs/smoke-atom-fp8-4k.log bash '$S'; \
+  tail -80 \"\$(cat /tmp/run_dapo_log.txt)\""
+
+# 确认 ATOM 正在跑 no-eager level=3（run_dapo.sh 的 MODE=atomfp8 覆盖项）。
+sudo docker exec "$CONTAINER" bash -lc '
+L=$(cat /tmp/run_dapo_log.txt)
+grep -aE "enforce_eager=false|compilation_config|level=3|TORCHDYNAMO_DISABLE=0|Ray ATOM rollout ready" "$L" | tail -20
+'
 ```
+
+如需对比 vLLM FP8 与 ATOM FP8 的 4k rollout，可把第二条换成
+`dapo_qwen3_8b_ray_vllm_fp8_4k_smoke.yaml`。如需验证训练侧 FP8 E2E，再单独设置
+`TRAIN_FP8=1`；这会触发 Lumen 训练侧 FP8 kernel/JIT，耗时应视为环境预热或单独测试，不要混入
+rollout smoke 性能对比。
 
 本机 run area 也可直接用 §8.1 的 `scripts/run_atom_fp8_4k_smoke.sh`，适合验证
 ATOM no-eager level=3 的短配置。
@@ -567,7 +741,9 @@ ATOM no-eager level=3 的短配置。
 Smoke 期望证据:
 - `RLTrainer.setup (ray-controller) complete: ... actor_workers=8`、`VLLMRayServer[i]: engine seed=<10086+i>`
   - ATOM:`ATOMRayServer[...] AsyncLLMEngine ready`、`Ray ATOM rollout ready: ... online_quant={'global_quant_config': 'per_block_fp8'}`
-- `[step 0] filter_groups round 1: kept N/96 prompt groups`（**kept 应 >0**；若 `kept 0/96` + `Rollout reward: accuracy=0.0000` + 大量 `finished with reason max`,是 rollout 退化,见 §12）
+  - ATOM no-eager level=3:日志中应能看到 `enforce_eager=false` / `compilation_config.level=3`
+    或等价的 ATOM engine kwargs；`TORCHDYNAMO_DISABLE=0`。
+- 小配置可能关闭 `filter_groups`；若开启，`kept` 应 >0。若 `kept 0/...` + `Rollout reward: accuracy=0.0000` + 大量 `finished with reason max`,是 rollout 退化,见 §12。
 - `callbacks: step=1 ... entropy=... grad_norm~0.85 ppo_kl=0`,exit 0
   - BF16:`rollout_corr/kl≈0.001`;vLLM-FP8:`≈0.003–0.004`;ATOM-FP8:`≈0.004`
 - FP8 训练额外:`[verl] Restored lm_head to BF16` / `Lumen optimizations applied`、`online fp8 reload: ...weights=399`
@@ -687,6 +863,10 @@ RMSNorm 未传 `use_model_sensitive_rmsnorm=1`,与训练侧 T5-like RMSNorm 不�
 - **ATOM rollout 侧**（`MODE=atomfp8`，仓库 `ATOM/atom/`，已随代码提交）：
   - `atom/model_ops/layernorm.py` 的 `rmsnorm2d_fwd_` / `rmsnorm2d_fwd_with_add_` 传
     `use_model_sensitive_rmsnorm=1`(与 vLLM RMSNorm patch 等价的 T5-like 对齐;否则 `rollout_corr/kl` ~0.007)。
+  - ATOM 使用本地 `aiter` 源码 JIT；`aiter/3rdparty/composable_kernel` submodule 必须拉取。
+    首次运行前建议按 §8.2 预编译 `module_rmsnorm`。首次 ATOM FP8 rollout 还可能继续编译
+    `module_gemm_a8w8_blockscale_bpreshuffle`、`module_activation`、`module_sample`、`module_rope_*`
+    / `module_cache` 等小模块；这些是环境预热成本。
   - `atom/rollout/weight_updater.py`：每次 ZMQ CUDA-IPC 权重更新把 BF16 训练权重**在线重量化**成 128×128
     block FP8(`quantize_weight_to_fp8_128x128_blockscale`),与 vLLM `fp8_per_block` 同理。
   - **no-eager level=3 正式方案**：`policy.generation.vllm_cfg.enforce_eager=false`、
