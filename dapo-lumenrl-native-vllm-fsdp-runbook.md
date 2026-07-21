@@ -157,7 +157,7 @@ cd "$AITER_DIR" && AITER_USE_SYSTEM_TRITON=1 python3 setup.py develop || pip ins
 pip install -e "$LUMEN_DIR" --no-deps || true
 cd "$RL_ROOT/Lumen-RL" && pip install -e . --no-deps
 pip install "ray[default]>=2.9" "accelerate>=0.28" datasets \
-  "math_verify[antlr4_13_2]" "omegaconf>=2.3,<2.4" safetensors
+  "math_verify[antlr4_13_2]" "omegaconf>=2.3,<2.4" safetensors wandb
 '
 ```
 > `MODE=atomfp8` 的 ATOM 引擎**无需单独 pip 安装**——`run_dapo.sh` 自动把 `$RL_ROOT/ATOM` 及
@@ -876,3 +876,297 @@ RMSNorm 未传 `use_model_sensitive_rmsnorm=1`,与训练侧 T5-like RMSNorm 不�
     `policy.generation.vllm_cfg.enable_sleep_mode=true`、`sleep_level=2`（训练前释放 rollout 显存）。
   - aiter shim `examples/DAPO/atom_aiter_shim/sitecustomize.py`:补齐 ATOM 所需的 aiter FP8/MLA 子模块
     (`run_dapo.sh` 自动挂到 PYTHONPATH,`LUMENRL_ATOM_AITER_SRC` 默认取 `$AITER_DIR`)。
+
+---
+
+## 14. verl 运行（复用同一环境：BF16 基线 + Lumen FP8 E2E）
+
+> 本节让**同一台机器、同一个容器**在原生 LumenRL 之外，再跑通 **verl `recipe/dapo`**（DAPO 动态采样）的
+> 两条路线，**完全复用前面第 3–6 节**的容器 (`$CONTAINER`)、模型 (`Qwen3-8B-Base`) 与过滤后的数据
+> (`data_cached/qwen3-8b-maxprompt1024/*.filtered.parquet`)，**无需重建容器、无需重下模型/数据**：
+>
+> - **BF16 基线**：`recipe.dapo.main_dapo` + BF16 FSDP 训练 + vLLM BF16 async rollout（AITER off，`quantization=null`）。
+> - **Lumen FP8 E2E**：`lumen.rl.verl.verl_entry`（`LUMEN_VERL_MAIN=dapo` 委托 dapo，保留 filter_groups）
+>   + FSDP2 actor Lumen FP8（blockwise2d linear + mha attn + model-sensitive RMSNorm）
+>   + vLLM async rollout `fp8_per_block` + AITER unified attention。
+>
+> 关键点：verl 与 Lumen/aiter 一样放在 `$RL_ROOT` 下（`$RL_ROOT/verl`），第 4 节 `-v "$RL_ROOT":"$RL_ROOT"`
+> 已把它挂进容器，因此**不用改容器**。`Lumen`(`amd-atom-rollout`)、`aiter`(`lumen/triton_kernels`) 已在第 3 节
+> clone，分支正好是 FP8 路线所需，直接复用；FP8 rollout 复用第 5 节的 vLLM AITER RMSNorm patch。
+> **已验证**：8×MI350X, Qwen3-8B-Base, 两条路线 smoke 各 1 步全过、exit 0、无 Traceback。
+
+### 14.1 追加拉取 verl（含 recipe 子模块 = DAPO 动态采样 trainer）
+
+| 仓库 | 分支/pin | 用途 |
+|---|---|---|
+| `verl` | `amd-v0.8.0` | unified engine + rollout `fp8_per_block` + worker-side Lumen hook (`8a8a9a8`) |
+| `recipe`（verl 子模块） | pin `e7f8895` | DAPO 动态采样 trainer（`recipe/dapo`），随子模块拉取 |
+
+非国内网络直接从 GitHub 拉取：
+
+```bash
+cd "$RL_ROOT"
+git clone -b amd-v0.8.0 https://github.com/xysheng-AMD/verl.git
+git -C verl submodule update --init --depth 1 recipe
+test -f verl/recipe/dapo/main_dapo.py && echo "recipe/dapo OK" || echo "MISSING recipe/dapo"
+```
+
+中国内网机器同第 3 节用代理镜像（不写死进 remote）：
+
+```bash
+cd "$RL_ROOT"
+GHP=https://gh-proxy.com/https://github.com
+git -c http.version=HTTP/1.1 clone --single-branch -b amd-v0.8.0 "$GHP/xysheng-AMD/verl.git"
+cd "$RL_ROOT/verl"
+git -c http.version=HTTP/1.1 \
+  -c url."$GHP/".insteadOf=https://github.com/ \
+  submodule update --init --depth 1 recipe
+test -f recipe/dapo/main_dapo.py && echo "recipe/dapo OK" || echo "MISSING recipe/dapo"
+```
+
+> `recipe/dapo`（动态采样 DAPO trainer）只在 verl 的 git 子模块里，不初始化就没有动态采样。
+> `verl amd-v0.8.0` HEAD 应含 `8a8a9a8 _build_model_optimizer hook + lm_head BF16 workaround + .clone() fix`
+> （FP8 E2E 必需：把 Lumen FP8 注入移进每个 Ray worker 的 `_build_model_optimizer`，并加 logits `.clone()`
+> 与 lm_head 保 BF16）。用 `git -C "$RL_ROOT/verl" log --oneline -1` 确认。
+
+### 14.2 在同一容器装 verl（不覆盖镜像内 vLLM/torch）
+
+```bash
+sudo docker exec "$CONTAINER" bash -lc '
+set -e
+git config --global --add safe.directory "$RL_ROOT/verl" || true
+cd "$RL_ROOT/verl"
+python3 -m pip install -e . --no-deps
+python3 -m pip install -r requirements.txt --upgrade-strategy only-if-needed
+'
+# 验证：verl / recipe.dapo 导入 + FP8 依赖 Lumen/aiter 导入 + vLLM patch 生效
+sudo docker exec "$CONTAINER" bash -lc '
+export PYTHONPATH=$RL_ROOT/verl:$RL_ROOT/aiter:$RL_ROOT/Lumen
+python3 - <<PY
+import verl, torch, vllm, ray, importlib, inspect
+print("verl", verl.__file__, "| torch", torch.__version__, "vllm", vllm.__version__, "ray", ray.__version__, "gpus", torch.cuda.device_count())
+importlib.import_module("recipe.dapo.main_dapo"); print("recipe.dapo OK")
+import lumen.quantize            # 先经 lumen.quantize 进入，避免 ops.quantize 直入触发循环 import
+from lumen.ops.quantize.ops import quant_fp8_blockwise_impl
+importlib.import_module("lumen.rl.verl.verl_entry"); print("lumen verl_entry OK")
+from vllm.kernels import aiter_ops as k
+ms = all("use_model_sensitive_rmsnorm=1" in inspect.getsource(getattr(k,a)) for a in ["_rms_norm_impl","_rocm_aiter_rmsnorm2d_fwd_with_add_impl"])
+print("vLLM RMSNorm model-sensitive patch:", ms, "(FP8 需为 True)")
+PY
+'
+```
+> - `requirements.txt` 会把 **numpy 降到 <2.0.0**（verl 硬性要求，例如 1.26.4）。这对 verl 与 LumenRL 都能正常
+>   跑；只是 `opencv-python-headless` 会有一条 `numpy>=2` 的告警，可忽略。若想彻底隔离，也可单独给 verl
+>   建一个同镜像的容器（`CONTAINER=rl-vllm-verl`，其余同第 4 节），但通常不必。
+> - FP8 E2E 依赖 Lumen/aiter 与第 5 节 vLLM RMSNorm patch。若第 5 节已在本容器打过，则 `patch: True`；否则先跑
+>   第 5 节的 `patch_vllm_aiter_rmsnorm.py`（BF16 路线不需要，AITER off）。
+> - `lumen.ops.quantize.ops` 若被**直接**首个导入会报“partially initialized … QuantizedLinearFunction”循环
+>   import；这是导入顺序假象。真实运行经 `lumen.quantize` 先进入即可，`verl_entry` 导入正常。
+
+### 14.3 BF16 smoke 脚本 `$RL_ROOT/run_smoke_dapo.sh`
+
+```bash
+cat > "$RL_ROOT/run_smoke_dapo.sh" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+: "${RL_ROOT:?}"; : "${DATA_ROOT:?}"
+WORKDIR=$RL_ROOT/verl
+MODEL_PATH=$DATA_ROOT/models/Qwen3-8B-Base
+DC=$DATA_ROOT/data_cached/qwen3-8b-maxprompt1024
+EXP_NAME="smoke-bf16-dapo-$(date +%Y%m%d-%H%M%S)"
+cd "$WORKDIR"; export PYTHONPATH=$WORKDIR
+export HF_HOME=$DATA_ROOT/hf_home HF_HUB_CACHE=$DATA_ROOT/cache/hub HF_DATASETS_CACHE=$DATA_ROOT/cache/datasets
+export RAY_DEDUP_LOGS=0 PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=false HYDRA_FULL_ERROR=1
+export TORCHDYNAMO_DISABLE=1 RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0 VLLM_USE_V1=1
+export HIP_FORCE_DEV_KERNARG=1 HSA_NO_SCRATCH_RECLAIM=1 CUDA_DEVICE_MAX_CONNECTIONS=1 VLLM_LOGGING_LEVEL=WARN
+export VLLM_ROCM_USE_AITER=0 VLLM_ROCM_USE_AITER_LINEAR=0 VERL_VLLM_ROCM_USE_AITER=0 VERL_VLLM_ROCM_USE_AITER_LINEAR=0
+export VERL_EMPTY_CACHE_PER_MICRO_BATCH=1
+unset CUDA_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES HIP_VISIBLE_DEVICES PYTORCH_CUDA_ALLOC_CONF PYTORCH_ALLOC_CONF 2>/dev/null || true
+unset RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES RAY_EXPERIMENTAL_NOSET_ROCR_VISIBLE_DEVICES
+python3 -m recipe.dapo.main_dapo \
+  data.train_files="$DC/dapo-math-17k.filtered.parquet" data.val_files="$DC/aime-2024.filtered.parquet" \
+  data.prompt_key=prompt data.truncation=left data.return_raw_chat=True data.filter_overlong_prompts=False \
+  data.max_prompt_length=1024 data.max_response_length=2048 data.train_batch_size=8 data.gen_batch_size=24 data.seed=10086 \
+  actor_rollout_ref.rollout.n=8 algorithm.adv_estimator=grpo algorithm.use_kl_in_reward=False algorithm.kl_ctrl.kl_coef=0.0 \
+  algorithm.filter_groups.enable=True algorithm.filter_groups.metric=acc algorithm.filter_groups.max_num_gen_batches=10 \
+  algorithm.rollout_correction.rollout_is=token algorithm.rollout_correction.rollout_is_threshold=2.0 \
+  algorithm.rollout_correction.rollout_is_batch_normalize=false algorithm.rollout_correction.rollout_rs=null algorithm.rollout_correction.rollout_rs_threshold=null \
+  actor_rollout_ref.model.path="$MODEL_PATH" actor_rollout_ref.model.use_remove_padding=True actor_rollout_ref.model.enable_gradient_checkpointing=True \
+  actor_rollout_ref.actor.strategy=fsdp actor_rollout_ref.actor.use_torch_compile=False \
+  actor_rollout_ref.actor.use_kl_loss=False actor_rollout_ref.actor.kl_loss_coef=0.0 \
+  actor_rollout_ref.actor.clip_ratio_low=0.2 actor_rollout_ref.actor.clip_ratio_high=0.28 actor_rollout_ref.actor.clip_ratio_c=10.0 \
+  actor_rollout_ref.actor.use_dynamic_bsz=True actor_rollout_ref.actor.ppo_max_token_len_per_gpu=4096 \
+  actor_rollout_ref.actor.ppo_mini_batch_size=8 actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
+  actor_rollout_ref.actor.loss_agg_mode=token-mean actor_rollout_ref.actor.entropy_coeff=0 actor_rollout_ref.actor.grad_clip=1.0 \
+  actor_rollout_ref.actor.optim.lr=1e-6 actor_rollout_ref.actor.optim.lr_warmup_steps=10 actor_rollout_ref.actor.optim.weight_decay=0.1 \
+  actor_rollout_ref.actor.ulysses_sequence_parallel_size=1 actor_rollout_ref.actor.fsdp_config.fsdp_size=-1 \
+  actor_rollout_ref.actor.fsdp_config.param_offload=true actor_rollout_ref.actor.fsdp_config.optimizer_offload=true \
+  actor_rollout_ref.actor.fsdp_config.seed=10086 actor_rollout_ref.actor.data_loader_seed=10086 \
+  actor_rollout_ref.rollout.name=vllm actor_rollout_ref.rollout.mode=async actor_rollout_ref.rollout.dtype=bfloat16 \
+  actor_rollout_ref.rollout.quantization=null actor_rollout_ref.rollout.calculate_log_probs=True \
+  actor_rollout_ref.rollout.tensor_model_parallel_size=1 actor_rollout_ref.rollout.gpu_memory_utilization=0.30 \
+  actor_rollout_ref.rollout.enable_chunked_prefill=True actor_rollout_ref.rollout.max_num_batched_tokens=8192 actor_rollout_ref.rollout.max_num_seqs=64 \
+  actor_rollout_ref.rollout.temperature=1.0 actor_rollout_ref.rollout.top_p=1.0 actor_rollout_ref.rollout.top_k=-1 \
+  actor_rollout_ref.rollout.enforce_eager=True actor_rollout_ref.rollout.free_cache_engine=True actor_rollout_ref.rollout.agent.num_workers=8 \
+  actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=4096 \
+  actor_rollout_ref.ref.use_torch_compile=False actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
+  actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=4096 \
+  actor_rollout_ref.ref.fsdp_config.param_offload=true actor_rollout_ref.ref.fsdp_config.seed=10086 actor_rollout_ref.ref.ulysses_sequence_parallel_size=1 \
+  reward.reward_manager.name=dapo reward.reward_kwargs.overlong_buffer_cfg.enable=True reward.reward_kwargs.overlong_buffer_cfg.len=512 \
+  reward.reward_kwargs.overlong_buffer_cfg.penalty_factor=1.0 reward.reward_kwargs.overlong_buffer_cfg.log=False reward.reward_kwargs.max_resp_len=2048 \
+  trainer.logger="['console']" trainer.project_name=AMD-BF16-VERL trainer.experiment_name="$EXP_NAME" \
+  trainer.n_gpus_per_node=8 trainer.nnodes=1 trainer.val_before_train=False trainer.test_freq=-1 trainer.save_freq=-1 \
+  trainer.total_epochs=1 trainer.total_training_steps=1 trainer.resume_mode=disable trainer.log_val_generations=0
+EOF
+chmod +x "$RL_ROOT/run_smoke_dapo.sh"
+```
+
+### 14.4 Lumen FP8 E2E smoke 脚本 `$RL_ROOT/run_smoke_dapo_fp8.sh`
+
+相对 14.3：入口换成 `lumen.rl.verl.verl_entry`（委托 dapo），actor `fsdp2` + Lumen FP8 env，rollout
+`fp8_per_block` + AITER unified attention。依赖第 3 节的 `Lumen`/`aiter` 与第 5 节 vLLM patch。
+
+```bash
+cat > "$RL_ROOT/run_smoke_dapo_fp8.sh" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+: "${RL_ROOT:?}"; : "${DATA_ROOT:?}"
+WORKDIR=$RL_ROOT/verl; LUMEN_DIR=$RL_ROOT/Lumen; AITER_DIR=$RL_ROOT/aiter
+MODEL_PATH=$DATA_ROOT/models/Qwen3-8B-Base
+DC=$DATA_ROOT/data_cached/qwen3-8b-maxprompt1024
+SEED=${SEED:-10086}; EXP_NAME="smoke-lumen-fp8pb-atom-mha-dapo-$(date +%Y%m%d-%H%M%S)"
+CKPTS_DIR="$DATA_ROOT/ckpts/$EXP_NAME"; mkdir -p "$CKPTS_DIR"
+cd "$WORKDIR"; touch recipe/dapo/config/__init__.py 2>/dev/null || true
+export PYTHONPATH=$WORKDIR:$AITER_DIR:$LUMEN_DIR MODEL_NAME=$MODEL_PATH
+export HF_HOME=$DATA_ROOT/hf_home HF_HUB_CACHE=$DATA_ROOT/cache/hub HF_DATASETS_CACHE=$DATA_ROOT/cache/datasets
+export RAY_DEDUP_LOGS=0 PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=false HYDRA_FULL_ERROR=1
+export TORCHDYNAMO_DISABLE=1 RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0 VLLM_USE_V1=1
+export HIP_FORCE_DEV_KERNARG=1 HSA_NO_SCRATCH_RECLAIM=1 CUDA_DEVICE_MAX_CONNECTIONS=1 VLLM_LOGGING_LEVEL=WARN
+export VERL_EMPTY_CACHE_PER_MICRO_BATCH=1
+# Lumen actor FP8 + ATOM 对齐 patch + 委托 dapo
+export LUMEN_VERL_MAIN=dapo LUMEN_FP8=1 LUMEN_ROLLOUT=ATOM LUMEN_FP8_FORMAT=fp8_e4m3 LUMEN_FP8_SCALING=blockwise2d LUMEN_FP8_BLOCK_SIZE=128
+export LUMEN_FP8_ATTN=mha LUMEN_FP8_QUANT_TYPE=blockwise LUMEN_ATTN_BACKEND=auto LUMEN_FORCE_FSDP=1
+export LUMEN_ACTOR_PATCH_NORM=1 LUMEN_ACTOR_PATCH_SDPA=1 LUMEN_ACTOR_PATCH_LINEAR=1 LUMEN_ACTOR_PATCH_MLP=1
+# vLLM rollout FP8 + AITER unified attention
+export ROLLOUT_QUANTIZATION=fp8_per_block KV_CACHE_DTYPE=auto CALCULATE_KV_SCALES=False VLLM_ROLLOUT_ATTENTION_BACKEND=ROCM_AITER_UNIFIED_ATTN
+export VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_AITER_LINEAR=0 VLLM_ROCM_USE_AITER_MHA=1 VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION=1
+export VERL_VLLM_ROCM_USE_AITER=1 VERL_VLLM_ROCM_USE_AITER_LINEAR=1
+export VLLM_FP8_PADDING=1 VLLM_FP8_ACT_PADDING=1 VLLM_FP8_WEIGHT_PADDING=1 VLLM_FP8_REDUCE_CONV=1
+unset CUDA_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES HIP_VISIBLE_DEVICES PYTORCH_CUDA_ALLOC_CONF PYTORCH_ALLOC_CONF 2>/dev/null || true
+unset RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES RAY_EXPERIMENTAL_NOSET_ROCR_VISIBLE_DEVICES
+python3 -m lumen.rl.verl.verl_entry \
+  data.train_files="$DC/dapo-math-17k.filtered.parquet" data.val_files="$DC/aime-2024.filtered.parquet" \
+  data.prompt_key=prompt data.truncation=left data.return_raw_chat=True data.filter_overlong_prompts=False \
+  data.max_prompt_length=1024 data.max_response_length=2048 data.train_batch_size=8 data.gen_batch_size=24 data.seed="$SEED" \
+  actor_rollout_ref.rollout.n=8 algorithm.adv_estimator=grpo algorithm.use_kl_in_reward=False algorithm.kl_ctrl.kl_coef=0.0 \
+  algorithm.filter_groups.enable=True algorithm.filter_groups.metric=acc algorithm.filter_groups.max_num_gen_batches=10 \
+  algorithm.rollout_correction.rollout_is=token algorithm.rollout_correction.rollout_is_threshold=2.0 \
+  algorithm.rollout_correction.rollout_is_batch_normalize=false algorithm.rollout_correction.rollout_rs=null algorithm.rollout_correction.rollout_rs_threshold=null \
+  actor_rollout_ref.model.path="$MODEL_PATH" actor_rollout_ref.model.use_remove_padding=True actor_rollout_ref.model.enable_gradient_checkpointing=True \
+  actor_rollout_ref.actor.strategy=fsdp2 actor_rollout_ref.actor.use_torch_compile=False \
+  actor_rollout_ref.actor.use_kl_loss=False actor_rollout_ref.actor.kl_loss_coef=0.0 \
+  actor_rollout_ref.actor.clip_ratio_low=0.2 actor_rollout_ref.actor.clip_ratio_high=0.28 actor_rollout_ref.actor.clip_ratio_c=10.0 \
+  actor_rollout_ref.actor.use_dynamic_bsz=True actor_rollout_ref.actor.ppo_max_token_len_per_gpu=3072 \
+  actor_rollout_ref.actor.ppo_mini_batch_size=8 actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
+  actor_rollout_ref.actor.loss_agg_mode=token-mean actor_rollout_ref.actor.entropy_coeff=0 actor_rollout_ref.actor.grad_clip=1.0 \
+  actor_rollout_ref.actor.optim.lr=1e-6 actor_rollout_ref.actor.optim.lr_warmup_steps=10 actor_rollout_ref.actor.optim.weight_decay=0.1 \
+  actor_rollout_ref.actor.ulysses_sequence_parallel_size=1 \
+  actor_rollout_ref.actor.fsdp_config.strategy=fsdp2 actor_rollout_ref.actor.fsdp_config.fsdp_size=-1 actor_rollout_ref.actor.fsdp_config.dtype=bfloat16 \
+  actor_rollout_ref.actor.fsdp_config.param_offload=true actor_rollout_ref.actor.fsdp_config.optimizer_offload=true \
+  actor_rollout_ref.actor.fsdp_config.seed="$SEED" actor_rollout_ref.actor.data_loader_seed="$SEED" \
+  actor_rollout_ref.rollout.name=vllm actor_rollout_ref.rollout.mode=async actor_rollout_ref.rollout.dtype=bfloat16 \
+  actor_rollout_ref.rollout.quantization="$ROLLOUT_QUANTIZATION" \
+  +actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_dtype="$KV_CACHE_DTYPE" \
+  +actor_rollout_ref.rollout.engine_kwargs.vllm.calculate_kv_scales="$CALCULATE_KV_SCALES" \
+  +actor_rollout_ref.rollout.engine_kwargs.vllm.attention_config="{backend: $VLLM_ROLLOUT_ATTENTION_BACKEND}" \
+  actor_rollout_ref.rollout.calculate_log_probs=True actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
+  actor_rollout_ref.rollout.gpu_memory_utilization=0.6 actor_rollout_ref.rollout.enable_chunked_prefill=True \
+  actor_rollout_ref.rollout.max_num_batched_tokens=8192 actor_rollout_ref.rollout.max_num_seqs=64 \
+  actor_rollout_ref.rollout.temperature=1.0 actor_rollout_ref.rollout.top_p=1.0 actor_rollout_ref.rollout.top_k=-1 \
+  actor_rollout_ref.rollout.enforce_eager=True actor_rollout_ref.rollout.free_cache_engine=True actor_rollout_ref.rollout.agent.num_workers=8 \
+  actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=3072 \
+  actor_rollout_ref.ref.use_torch_compile=False actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
+  actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=3072 \
+  actor_rollout_ref.ref.fsdp_config.param_offload=true actor_rollout_ref.ref.fsdp_config.seed="$SEED" actor_rollout_ref.ref.ulysses_sequence_parallel_size=1 \
+  reward.reward_manager.name=dapo reward.reward_kwargs.overlong_buffer_cfg.enable=True reward.reward_kwargs.overlong_buffer_cfg.len=512 \
+  reward.reward_kwargs.overlong_buffer_cfg.penalty_factor=1.0 reward.reward_kwargs.overlong_buffer_cfg.log=False reward.reward_kwargs.max_resp_len=2048 \
+  trainer.logger="['console']" trainer.project_name=AMD-BF16-VERL trainer.experiment_name="$EXP_NAME" \
+  trainer.n_gpus_per_node=8 trainer.nnodes=1 trainer.val_before_train=False trainer.test_freq=-1 trainer.save_freq=-1 \
+  trainer.total_epochs=1 trainer.total_training_steps=1 trainer.default_local_dir="$CKPTS_DIR" trainer.resume_mode=disable trainer.log_val_generations=0
+EOF
+chmod +x "$RL_ROOT/run_smoke_dapo_fp8.sh"
+```
+
+### 14.5 跑 Smoke（先各 1 step 验证整链路）
+
+```bash
+sudo docker restart "$CONTAINER"; sleep 6            # 清残留 ray 进程
+# BF16 smoke
+sudo docker exec -e RL_ROOT="$RL_ROOT" -e DATA_ROOT="$DATA_ROOT" "$CONTAINER" \
+  bash -lc "bash $RL_ROOT/run_smoke_dapo.sh" 2>&1 | tee $DATA_ROOT/logs/verl_smoke_bf16_$(date +%Y%m%d-%H%M%S).log
+
+# FP8 E2E smoke
+sudo docker restart "$CONTAINER"; sleep 6
+sudo docker exec -e RL_ROOT="$RL_ROOT" -e DATA_ROOT="$DATA_ROOT" "$CONTAINER" \
+  bash -lc "bash $RL_ROOT/run_smoke_dapo_fp8.sh" 2>&1 | tee $DATA_ROOT/logs/verl_smoke_fp8_$(date +%Y%m%d-%H%M%S).log
+```
+
+期望证据（已验证：8×MI350X, Qwen3-8B-Base, 各 1 步, exit 0, 无 Traceback）：
+
+| 证据 | BF16 | Lumen FP8 E2E |
+|---|---|---|
+| `step:1 ... actor/loss ... actor/grad_norm` | loss≈-0.093, grad_norm≈1.09 | loss≈0.028, grad_norm≈0.89 |
+| `rollout_corr/rollout_is_mean` | ≈1.0（0.9999） | ≈1.0（1.0000） |
+| `rollout_corr/kl` | ≈0.001 | **≈0.005**（FP8 gap，正常；逼近 2.0 才警惕） |
+| `train/num_gen_batches` | ≥1（filter_groups 动态采样生效） | ≥1（同） |
+| FP8 特有 | — | 8 worker `[verl] Lumen optimizations applied (actor/full) before FSDP2 wrapping`；vLLM `quantization=fp8_per_block`；`kernel_unified_attention_3d` JIT（AITER unified attention 生效） |
+| 收尾 | `Final validation metrics: None`（未测评） | 同左；首次会 JIT 编译 aiter `module_rmsnorm` / per-block GEMM（较慢，二次快） |
+
+### 14.6 长跑规模（相对 smoke 只放大规模/落盘）
+
+把 14.3 / 14.4 复制为 `run_longrun_dapo.sh` / `run_longrun_dapo_fp8.sh`，按下面替换规模参数：
+`max_response_length=20480`、`train_batch_size=32`、`gen_batch_size=96`、`rollout.n=16`、`ppo_mini_batch_size=32`、
+`ppo_max_token_len_per_gpu=21504`、`log_prob_max_token_len_per_gpu=21504`、`gpu_memory_utilization=0.6`(FP8)/`0.30`(BF16)、
+`max_num_batched_tokens=32768`、`reward.reward_kwargs.overlong_buffer_cfg.len=4096`、`reward.reward_kwargs.max_resp_len=20480`，
+并在 trainer 段加：
+
+```bash
+  trainer.save_freq=20 trainer.max_actor_ckpt_to_keep=5 trainer.test_freq=10 trainer.total_training_steps=500 \
+  trainer.default_local_dir="$CKPTS_DIR" trainer.log_val_generations=1
+```
+
+长跑开 wandb（脚本头部 `cd`/PYTHONPATH 之后加，复用第 3 节 `$RL_ROOT/wandb.key`，格式 `WANDB_API_KEY=xxxx`）：
+
+```bash
+WANDB_KEY_FILE=${WANDB_KEY_FILE:-$RL_ROOT/wandb.key}
+if [ -z "${WANDB_API_KEY:-}" ] && [ -f "$WANDB_KEY_FILE" ]; then export WANDB_API_KEY="$(cut -d= -f2- "$WANDB_KEY_FILE" | tr -d '[:space:]')"; fi
+LOGGER=$([ -n "${WANDB_API_KEY:-}" ] && echo "['console','wandb']" || echo "['console']")
+export WANDB_DIR=$DATA_ROOT/wandb
+```
+
+并把 `trainer.logger` 改为 `trainer.logger="$LOGGER"`（project `AMD-BF16-VERL`）。后台起长跑：
+
+```bash
+sudo docker restart "$CONTAINER"; sleep 6
+LOG=$DATA_ROOT/logs/verl_longrun_fp8_$(date +%Y%m%d-%H%M%S).log
+sudo docker exec -d -e RL_ROOT="$RL_ROOT" -e DATA_ROOT="$DATA_ROOT" "$CONTAINER" \
+  bash -lc "bash $RL_ROOT/run_longrun_dapo_fp8.sh > $LOG 2>&1"
+echo "LOG=$LOG"; sleep 200
+grep -aE "step:[0-9]+ -" "$LOG" | tail -1      # 最新 step 指标
+# 停止：sudo docker exec "$CONTAINER" bash -lc "pkill -9 -f 'main_[d]apo|verl_entry'; ray stop --force"
+```
+
+### 14.7 verl vs LumenRL / BF16 vs FP8 一览
+
+| 维度 | verl BF16 | verl Lumen FP8 E2E | LumenRL 原生（§1） |
+|---|---|---|---|
+| 入口 | `recipe.dapo.main_dapo` | `lumen.rl.verl.verl_entry`（→ dapo） | `lumenrl.trainer.main` |
+| actor 策略 | FSDP | FSDP2 + Lumen ATOM(norm/sdpa/linear/mlp) | Lumen FSDP2 |
+| actor 量化 | 无（BF16） | ATOM 对齐 + blockwise2d linear + mha attn + model-sensitive RMSNorm | 可选 FP8 blockwise2d |
+| rollout | vLLM async BF16，`quantization=null`，AITER off | vLLM async，`quantization=fp8_per_block`，AITER unified attention | vLLM/ATOM AsyncLLM |
+| 动态采样 | filter_groups (acc) | filter_groups (acc)（保留） | `algorithm.dapo.filter_groups` |
+| 需手动 patch | 无 | 复用第 5 节 vLLM AITER RMSNorm patch | 第 5 节同 patch |
+| 复用资源 | §3 clone(+verl)、§4 容器、§6 模型/数据 | 同 + §3 的 Lumen/aiter | §3–§6 |
+
+> 排障速查：FP8 若 `rollout_corr/kl` 异常偏大或发散，多半是第 5 节 vLLM RMSNorm patch 未打（新容器需重打），
+> 或 Lumen/aiter 未在 `PYTHONPATH`。BF16 路线 `VLLM_ROCM_USE_AITER=0`，不依赖该 patch。
