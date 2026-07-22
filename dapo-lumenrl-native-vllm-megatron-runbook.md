@@ -17,12 +17,15 @@
 > **一句话复现**:设路径变量 → clone 3 仓库(Lumen-RL 用含 Megatron 后端的分支)→ 起容器 → 装 LumenRL 依赖
 > **并额外装 `megatron-core`(仅此一个,无需编译 apex/TE)** → 下模型/数据 → 过滤 → smoke → 长跑。
 >
-> ✅ 已验证:8×MI355X(gfx950)、Qwen3-8B-Base、BF16 smoke exit 0,指标健康
-> (entropy≈0.6、grad_norm≈0.8、ppo_kl=0、rollout_corr/kl≈0.002),**每卡 actor 显存 ≈60GB**
-> (分布式优化器分片,和 vime 的 ~57GB 同量级),稳态 **train ≈1.9s/步**(FSDP2 约 7s,vime 约 2.1s)。
+> ✅ 已验证:8×MI355X(gfx950)、Qwen3-8B-Base。
+> - **BF16 smoke** exit 0,指标健康(entropy≈0.6、grad_norm≈0.8、ppo_kl=0、rollout_corr/kl≈0.002),
+>   **每卡 actor 显存 ≈60GB**(分布式优化器分片,和 vime 的 ~57GB 同量级),稳态 **train ≈1.9s/步**。
+> - **BF16 longrun**(resp=20480,1000 步) 正常训练:开 **flash attention + 分块 log-prob + 动态打包**(§7.1)后
+>   训练峰值 **~110GB/卡**(未开 FA 时 O(L²) attn 会 >230GB → OOM);训练算子 ~13s→**~9.7s/步**(打包);
+>   指标健康(entropy≈0.6、grad_norm≈0.26、ppo_kl≈0)。
 >
 > ℹ️ 运行时用 **Megatron local spec + torch RMSNorm**(非 TE),**不依赖 apex / Transformer Engine**;只装
-> `megatron-core` 即可(megatron-core 自动回退到 torch norm / torch 优化器)。
+> `megatron-core` 即可(自动回退 torch norm / torch 优化器)。长序列注意力用容器自带 `flash_attn`(§7.1),同样**无需 TE**。
 
 ---
 
@@ -242,23 +245,56 @@ $DATA_ROOT/data_cached/qwen3-8b-maxprompt1024/aime-2024.filtered.parquet       #
 | 路线 | config 文件 |
 |---|---|
 | **Megatron BF16 smoke** | `examples/DAPO/configs/dapo_qwen3_8b_ray_megatron_smoke.yaml` |
+| **Megatron BF16 longrun** | `examples/DAPO/configs/dapo_qwen3_8b_ray_megatron_longrun.yaml` |
 
-该 config = FSDP 的 `dapo_qwen3_8b_ray_vllm_smoke.yaml` 复制版,只改两处:
+smoke = FSDP 的 `dapo_qwen3_8b_ray_vllm_smoke.yaml` 复制版;longrun = FSDP `..._vllm_longrun.yaml`
+复制版。相对 FSDP 路线的差异:
 
 | 项 | 值 |
 |---|---|
 | `policy.training_backend` | **`megatron`**（触发 MegatronEngine） |
 | `policy.generation.vllm_cfg.enable_sleep_mode` / `sleep_level` | **`true`** / `2`（训练时休眠 vLLM 让出显存） |
+| `policy.training.megatron_cfg` | 见下（分布式优化器 + 长序列显存开关） |
 
-规模/超参与 FSDP smoke 相同:resp=512、`train_global_batch_size=128`(8×16)、`gen_batch_size=24`、
-`num_generations=16`、lr 1e-6 / warmup 10、clip 0.2/0.28/c=10、filter_groups(acc)、TIS thr=2.0、seed 10086。
+smoke 规模:resp=512、`train_global_batch_size=128`(8×16)、`gen_batch_size=24`、`num_generations=16`、
+lr 1e-6 / warmup 10、clip 0.2/0.28/c=10、filter_groups(acc)、TIS thr=2.0、seed 10086。
+longrun 正式规模:resp=20480、`max_total_sequence_length=21504`、`max_token_len_per_gpu=21504`、
+batch=512、gen_batch=96、`num_generations=16`、`num_training_steps=1000`、val 每 10 步、save 每 50 步、
+wandb `project=LumenRL`。
 
-> Megatron 并行度默认 TP=1/PP=1/CP=1/DP=8(可在 config 里 `policy.training.megatron_cfg` 覆盖
-> `tensor_model_parallel_size` 等)。分布式优化器由引擎固定开启(`use_distributed_optimizer=True`)。
+### 7.1 `megatron_cfg` 显存开关（smoke 与 longrun 都已开启 FA + chunk）
 
-**长跑**:把上面 smoke config 复制为 `..._megatron_longrun.yaml`,按 FSDP runbook §7 正式规模放大
-(resp=20480、batch=512、gen_batch=96、num_generations=16、`max_total_sequence_length=21504`、
-`max_token_len_per_gpu=21504`),`training_backend` 保持 `megatron`,`num_training_steps=1000`。
+```yaml
+policy:
+  training:
+    megatron_cfg:
+      use_distributed_optimizer: true    # 引擎也会强制开;FP32 master+Adam 分片到 DP
+      recompute_granularity: full        # 激活重计算(逐层),bound 激活峰值(longrun)
+      recompute_method: uniform
+      recompute_num_layers: 1
+      attention_backend: flash           # ★ flash attention:O(L) 显存(替代 local O(L^2))
+      log_probs_chunk_size: 1024         # ★ 融合/分块 token log-prob:单个 [chunk,V] softmax 缓冲
+      enable_dynamic_batch: true         # ★ 动态打包:多条序列 concat 成一次 varlen 前向
+      max_tokens_per_gpu: 21504          #   每次前向 token 预算(smoke 用 2048)
+```
+
+> **为什么需要 FA + chunk**:Megatron local spec 的 `DotProductAttention` 会物化完整 O(L²) 注意力分数矩阵,
+> 且 log-prob 走 `log_softmax([L,V])` 保留多份 [L,V] 张量。resp=20480 时训练峰值 >230GB/卡 → OOM。
+> - `attention_backend: flash` → 把 spec 的 `core_attention` 换成 `FlashSelfAttentionCore`(用容器自带
+>   `flash_attn`,**无需 TransformerEngine**),注意力显存降为 O(L)(对齐 vime 的 `--attention-backend flash`)。
+> - `log_probs_chunk_size>0` → 用 `_FusedTokenLogProb`(单个 [L,V] softmax 缓冲,反向精确)+ 分块 no-grad
+>   log-prob/entropy(对齐 vime 的 `--log-probs-chunk-size`)。
+>
+> 三个开关**默认关闭**(不写 `megatron_cfg` 即回到旧的逐条前向行为);smoke/longrun config 里都已显式开启。
+> 开启后 longrun 训练峰值 **~230GB → ~110GB/卡**(FA+chunk 生效),vLLM 保持满 `gpu_memory_utilization=0.30`。
+>
+> **`enable_dynamic_batch`(动态打包,对齐 vime `--use-dynamic-batch-size`)**:把一个 micro-batch 的多条序列
+> 按 `max_tokens_per_gpu` 贪心分箱、concat 成一条 `[1,T]` 流,用 **thd `PackedSeqParams` + `flash_attn_varlen_func`
+> (cu_seqlens)** 做**一次** varlen 前向(每条 rotary/attention 由 cu_seqlens 隔离,数值与逐条前向完全一致,
+> 已验证 diff=0)。短序列因此能打满 GEMM,减少 kernel launch。训练算子:逐条 ~13s → 打包 **~9.7s**(begin step,
+> 含 20k 长尾;纯短序列收益更大)。显存不增(token 预算不变)。**需要 `attention_backend: flash`(引擎会自动置上)。**
+
+> Megatron 并行度默认 TP=1/PP=1/CP=1/DP=8(可在 `megatron_cfg` 里覆盖 `tensor_model_parallel_size` 等)。
 
 ---
 
@@ -351,9 +387,14 @@ apex FusedLayerNorm,而它不支持 RMSNorm)。引擎已在 `initialize()` 里 `
 并把 spec 的各 norm 替换为 `WrappedTorchNorm`,正常不会触发;不装 apex 时 megatron 默认就是 torch norm,更不会触发。
 本 runbook 不装 apex,可忽略。
 
-**显存**:开分布式优化器后每卡 actor ≈60GB(FP32 master + Adam 状态分片到 8 DP)。若仍 OOM:降
-`gpu_memory_utilization`、`max_token_len_per_gpu`、`train_global_batch_size` 或 resp 长度。**未开**分布式优化器
+**显存**:开分布式优化器后每卡 actor ≈60GB(FP32 master + Adam 状态分片到 8 DP)。**未开**分布式优化器
 (每卡全量复制 optimizer)会到 ~184GB。
+
+**长序列 OOM(resp=20480)**:若 `megatron_cfg` 里**没开** `attention_backend: flash` + `log_probs_chunk_size`,
+Megatron local attention 的 O(L²) 分数矩阵 + 完整 [L,V] `log_softmax` 会让训练峰值 >230GB/卡 → OOM
+(报错 `Tried to allocate 3x.xx GiB ... update_policy`)。**解法就是 §7.1 的两个开关**(smoke/longrun 已默认开启),
+开启后峰值 ~67GB/卡,vLLM 可保持 `gpu_memory_utilization=0.30`。仍 OOM 再降 `gpu_memory_utilization` /
+`max_token_len_per_gpu` / `train_global_batch_size` / resp 长度。
 
 **首步很慢 / 长时间无日志**:首次 GPTModel 构建 + 8B HF 权重加载(每 rank)+ aiter JIT,属环境预热,不算训练性能。
 
@@ -380,6 +421,14 @@ apex FusedLayerNorm,而它不支持 RMSNorm)。引擎已在 `initialize()` 里 `
   + `OptimizerParamScheduler`;engine-level `engine_compute_log_probs` / `engine_update_policy`(DAPO/GRPO+TIS,
   `finalize_model_grads` → `optimizer.step()`);`get_per_tensor_param` = Megatron→HF 导出供 vLLM IPC 同步。
   注册 `backend="megatron"`。
+  长序列显存两件套(§7.1,由 `megatron_cfg` 开关触发):
+  - `FlashSelfAttentionCore`:`attention_backend=flash` 时换进 spec 的 `core_attention`,用 `flash_attn`(O(L),
+    原生 GQA/causal,无需 TE)替代 local 的 O(L²) `DotProductAttention`。
+  - `_FusedTokenLogProb`(autograd)+ `_token_logprob_train` / `_logprob_entropy_nograd`:`log_probs_chunk_size>0`
+    时启用,单个 [L,V] softmax 缓冲 + 分块,消掉 `log_softmax([L,V])` 的多份 [L,V] 峰值。
+  - `_forward_logits_packed` + `_build_bins` + `_row_policy_loss`:`enable_dynamic_batch=true` 时,把行按
+    `max_tokens_per_gpu` 贪心分箱,concat 成 thd `PackedSeqParams` 做一次 `flash_attn_varlen` 前向,按 cu_seqlens
+    切回每条算 loss、整箱一次 backward(`engine_update_policy` / `engine_compute_log_probs` 均支持)。
 - `lumenrl/engine/training/qwen3_megatron_bridge.py`:HF Qwen3 ↔ Megatron `GPTModel` 权重双向转换
   (GQA 交织 `linear_qkv`、融合 `linear_fc1=[gate;up]`、per-head q/k norm)。
 - `lumenrl/workers/actor_worker.py`:`compute_log_probs` / `update_policy` 检测到 engine 暴露 `engine_*` 时委托给
