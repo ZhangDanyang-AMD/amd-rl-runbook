@@ -15,11 +15,14 @@
 >   `vllm/vllm-openai-rocm:v0.23.0`(含 vllm 0.23 + torch-ROCm)。
 >
 > **一句话复现**:设路径变量 → clone 3 仓库(Lumen-RL 用含 Megatron 后端的分支)→ 起容器 → 装 LumenRL 依赖
-> **并额外装 `megatron-core`(必需)+ 可选 apex/TE(ROCm 源码编译)** → 下模型/数据 → 过滤 → smoke → 长跑。
+> **并额外装 `megatron-core`(仅此一个,无需编译 apex/TE)** → 下模型/数据 → 过滤 → smoke → 长跑。
 >
 > ✅ 已验证:8×MI355X(gfx950)、Qwen3-8B-Base、BF16 smoke exit 0,指标健康
 > (entropy≈0.6、grad_norm≈0.8、ppo_kl=0、rollout_corr/kl≈0.002),**每卡 actor 显存 ≈60GB**
 > (分布式优化器分片,和 vime 的 ~57GB 同量级),稳态 **train ≈1.9s/步**(FSDP2 约 7s,vime 约 2.1s)。
+>
+> ℹ️ 运行时用 **Megatron local spec + torch RMSNorm**(非 TE),**不依赖 apex / Transformer Engine**;只装
+> `megatron-core` 即可(megatron-core 自动回退到 torch norm / torch 优化器)。
 
 ---
 
@@ -91,7 +94,7 @@ git -c http.version=HTTP/1.1 -c url."$GHP/".insteadOf=https://github.com/ \
 | `Lumen` | `amd-atom-rollout` | Lumen 库（rollout/工具依赖） |
 | `aiter` | `lumen/triton_kernels` | AMD kernel（vLLM/训练用） |
 
-> Megatron 后端只依赖 `megatron-core`(§5.1),不依赖 verl / megatron-bridge / modelopt(旧 scaffold 才需要)。
+> Megatron 后端只依赖 `megatron-core`(§5.2),不依赖 apex / Transformer Engine / verl / megatron-bridge / modelopt。
 
 ---
 
@@ -113,8 +116,8 @@ sudo docker run -d --name "$CONTAINER" --entrypoint /bin/bash \
   vllm/vllm-openai-rocm:v0.23.0 -lc 'sleep infinity'
 ```
 > 若 docker 可免 sudo(用户在 docker 组),去掉 `sudo` 即可。容器 `stop/start` 不丢依赖;`docker rm` 才丢
-> (丢了要重跑第 5 节,含 apex/TE 编译)。**建议装完依赖后 `docker commit "$CONTAINER" rl-vllm-megatron:built`
-> 保存镜像**,换机/重建直接用该镜像,省去 apex/TE 重编译。
+> (丢了要重跑第 5 节)。依赖很轻(只多一个 `megatron-core` wheel),无需编译,重装很快;也可
+> `docker commit "$CONTAINER" rl-vllm-megatron:built` 保存镜像备用。
 
 ---
 
@@ -136,55 +139,25 @@ pip install "ray[default]>=2.9" "accelerate>=0.28" datasets \
 '
 ```
 
-### 5.2 Megatron-Core（**必需**）
+### 5.2 Megatron-Core（**唯一额外依赖**）
 
 ```bash
 sudo docker exec "$CONTAINER" bash -lc 'pip install --no-deps megatron-core==0.18.2'
-# 验证：能 import 且回退到 Torch norm/optimizer（无 TE/apex 也能跑）
+# 验证：能 import，且自动回退到 Torch norm / Torch 优化器（无需 apex / TE）
 sudo docker exec "$CONTAINER" bash -lc '
 python3 - <<PY
 import megatron.core as mc
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.transformer.torch_norm import WrappedTorchNorm
-print("megatron.core", mc.__version__, "OK (torch-norm fallback available)")
+print("megatron.core", mc.__version__, "OK (torch-norm / torch-optimizer fallback)")
 PY'
 ```
-> Megatron 引擎默认用 **local spec + torch RMSNorm**(引擎里 `tb.LayerNormImpl = WrappedTorchNorm`),
-> 因此**仅 `megatron-core` 即可跑通 BF16 smoke**;apex/TE 是可选的融合加速(见 §5.3)。
+> Megatron 引擎运行时用 **local spec + torch RMSNorm**(引擎里 `tb.LayerNormImpl = WrappedTorchNorm`)+
+> Megatron 分布式优化器(无 apex 时走 torch 实现)。**因此只需 `megatron-core` 一个 wheel,不用编译 apex / TE**。
+> 装 megatron-core 时看到 `Transformer Engine and Apex are not installed. Falling back to Torch ...` 属正常,
+> 不影响 BF16 smoke。
 
-### 5.3 apex + Transformer Engine（可选：ROCm 源码编译，融合 kernel / 未来 TE spec）
-
-> 已验证 gfx950 + torch2.10+hip7.2 可源码编译成功。**不装也能跑**(引擎走 torch 回退);装了可用于后续切
-> TE layer spec / 融合 RMSNorm / 融合优化器。⚠️ 不要从别的镜像拷贝已编译的 apex/TE 二进制——torch C++ ABI
-> (`c10::hip` 符号)不匹配会 `undefined symbol`,必须针对本镜像 torch 源码编译。
-
-```bash
-# --- apex (ROCm) ---
-sudo docker exec "$CONTAINER" bash -lc '
-set -e; cd "$RL_ROOT"
-git clone --depth 1 https://github.com/ROCm/apex.git apex_src || true
-git config --global --add safe.directory "$RL_ROOT/apex_src" || true
-cd apex_src
-PYTORCH_ROCM_ARCH=gfx950 MAX_JOBS=32 pip install -v --disable-pip-version-check \
-  --no-build-isolation --no-cache-dir \
-  --config-settings "--build-option=--cpp_ext" --config-settings "--build-option=--cuda_ext" ./
-'
-# ROCm/apex 的 C++ ext 走 JIT-load：首次 import 会编译（amp_C 约 20s），之后缓存。
-
-# --- Transformer Engine (ROCm，关闭 fused-attn 以缩短编译) ---
-sudo docker exec "$CONTAINER" bash -lc '
-set -e; cd "$RL_ROOT"
-git clone --depth 1 --recursive https://github.com/ROCm/TransformerEngine.git te_src || true
-git config --global --add safe.directory "$RL_ROOT/te_src" || true
-cd te_src
-NVTE_FRAMEWORK=pytorch NVTE_USE_ROCM=1 PYTORCH_ROCM_ARCH=gfx950 \
-NVTE_FUSED_ATTN=0 NVTE_FUSED_ATTN_CK=0 NVTE_FUSED_ATTN_AOTRITON=0 NVTE_FLASH_ATTN=0 \
-MAX_JOBS=48 pip install -v --no-build-isolation .
-'
-```
-> TE 编译约 15–30 分钟(已关 CK/AOTriton fused-attn,否则要几小时)。引擎当前用 local spec,不依赖 TE fused-attn。
-
-### 5.4 验证 LumenRL + Megatron 引擎可导入
+### 5.3 验证 LumenRL + Megatron 引擎可导入
 
 ```bash
 sudo docker exec "$CONTAINER" bash -lc '
@@ -316,7 +289,7 @@ sudo docker exec "$CONTAINER" bash -lc "$ENVX \
 - `callbacks: step=1 entropy≈0.6 grad_norm≈0.8 ppo_kl=0 rollout_corr/kl≈0.002 ...`,exit 0
 - `mem/actor_max_allocated_gb ≈ 60`(分布式优化器分片后的显存;若 ~184GB 说明没开分布式优化器)
 - **不应**出现:`RMSNorm ... is not supported in FusedLayerNorm`(引擎会强制 torch RMSNorm,正常不触发)、
-  `undefined symbol: c10::hip...`(apex/TE 用了别的镜像编的二进制,须本镜像源码编)、`OutOfMemory`、entropy≈4+。
+  `OutOfMemory`、entropy≈4+(前向退化)。
 
 > 首步慢:首次含 GPTModel 构建 + HF 权重加载(8B,每 rank)+ aiter/torch 编译;稳态 train ≈1.9s/步。
 
@@ -373,12 +346,10 @@ sudo docker exec "$CONTAINER" bash -lc '
 
 ## 12. 排障 / 内存 / 与 FSDP·vime 对比
 
-**`(RMSNorm) is not supported in FusedLayerNorm`**:装了 apex 时 megatron 默认选 apex FusedLayerNorm(不支持
-RMSNorm)。引擎已在 `initialize()` 里 `tb.LayerNormImpl = WrappedTorchNorm` 并把 spec 的各 norm 替换为
-`WrappedTorchNorm`,正常不会触发;若你改了引擎需保留该覆盖。
-
-**`undefined symbol: _ZN3c103hip...`**(import apex/TE 时):用了**别的镜像/别的 torch build 编的** apex/TE 二进制,
-torch C++ ABI(`c10::hip`)不匹配。必须按 §5.3 针对**本镜像的 torch** 源码编译,不能跨镜像拷贝 `.so`。
+**`(RMSNorm) is not supported in FusedLayerNorm`**:只在**你另外装了 apex** 时才可能触发(megatron 会默认选
+apex FusedLayerNorm,而它不支持 RMSNorm)。引擎已在 `initialize()` 里 `tb.LayerNormImpl = WrappedTorchNorm`
+并把 spec 的各 norm 替换为 `WrappedTorchNorm`,正常不会触发;不装 apex 时 megatron 默认就是 torch norm,更不会触发。
+本 runbook 不装 apex,可忽略。
 
 **显存**:开分布式优化器后每卡 actor ≈60GB(FP32 master + Adam 状态分片到 8 DP)。若仍 OOM:降
 `gpu_memory_utilization`、`max_token_len_per_gpu`、`train_global_batch_size` 或 resp 长度。**未开**分布式优化器
