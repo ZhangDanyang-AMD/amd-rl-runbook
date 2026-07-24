@@ -27,7 +27,7 @@
 > ℹ️ 运行时用 **Megatron local spec + torch RMSNorm**(非 TE),**不依赖 apex / Transformer Engine**;只装
 > `megatron-core` 即可(自动回退 torch norm / torch 优化器)。长序列注意力用容器自带 `flash_attn`(§7.1),同样**无需 TE**。
 >
-> ⚠️ 本文档保留的是 legacy `backend="megatron"` 路线。固定 revision 中的 Megatron YAML
+> ⚠️ 本文档保留的是 legacy `backend="megatron"` 路线。当前分支中的 Megatron YAML
 > 已默认使用 `megatron_native`；本文所有启动命令都显式传
 > `policy.training_backend=megatron`。新部署优先使用
 > `dapo-lumenrl-vllm-fsdp-megatron-new-machine-runbook.md`。
@@ -76,7 +76,6 @@ mkdir -p "$RL_ROOT" "$DATA_ROOT/logs"
 cd "$RL_ROOT"
 # Lumen-RL：dev/vllm-fsdp-dapo 分支已包含 Megatron 训练后端（VIME-style GPTModel）
 git clone -b dev/vllm-fsdp-dapo   https://github.com/ZhangDanyang-AMD/Lumen-RL.git
-git -C Lumen-RL checkout 523e92329d312a3265e0a031dd7982b0529c3ef5
 git clone -b amd-atom-rollout     https://github.com/ZhangDanyang-AMD/Lumen.git
 git clone -b lumen/triton_kernels https://github.com/ZhangDanyang-AMD/aiter.git
 
@@ -91,7 +90,6 @@ git submodule update --init --depth 1 3rdparty/composable_kernel
 cd "$RL_ROOT"
 GHP=https://gh-proxy.com/https://github.com
 git -c http.version=HTTP/1.1 clone --depth 1 --single-branch -b dev/vllm-fsdp-dapo   "$GHP/ZhangDanyang-AMD/Lumen-RL.git"
-git -C Lumen-RL checkout 523e92329d312a3265e0a031dd7982b0529c3ef5
 git -c http.version=HTTP/1.1 clone --depth 1 --single-branch -b amd-atom-rollout     "$GHP/ZhangDanyang-AMD/Lumen.git"
 git -c http.version=HTTP/1.1 clone --depth 1 --single-branch -b lumen/triton_kernels "$GHP/ZhangDanyang-AMD/aiter.git"
 cd "$RL_ROOT/aiter"
@@ -101,9 +99,15 @@ git -c http.version=HTTP/1.1 -c url."$GHP/".insteadOf=https://github.com/ \
 
 | 仓库 | 分支 | 用途 |
 |---|---|---|
-| `Lumen-RL` | `dev/vllm-fsdp-dapo` @ `523e92329d312a3265e0a031dd7982b0529c3ef5` | RL 主框架 **+ Megatron 训练后端** |
+| `Lumen-RL` | `dev/vllm-fsdp-dapo`（跟踪分支最新 HEAD） | RL 主框架 **+ Megatron 训练后端** |
 | `Lumen` | `amd-atom-rollout` | Lumen 库（rollout/工具依赖） |
 | `aiter` | `lumen/triton_kernels` | AMD kernel（vLLM/训练用） |
+
+已有 checkout 获取后续 Lumen-RL 更新：
+
+```bash
+git -C "$RL_ROOT/Lumen-RL" pull --ff-only origin dev/vllm-fsdp-dapo
+```
 
 > Megatron 后端只依赖 `megatron-core`(§5.2),不依赖 apex / Transformer Engine / verl / megatron-bridge / modelopt。
 

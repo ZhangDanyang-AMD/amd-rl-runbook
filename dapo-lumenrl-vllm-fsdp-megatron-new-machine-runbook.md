@@ -1,8 +1,8 @@
 # LumenRL DAPO 双后端新机 Runbook（FSDP2 + Megatron-Native）
 
-> 目标：在一台全新的 8 卡 AMD `gfx950` 机器上，仅通过在线拉取固定 revision 的代码、
-> 固定 digest 的 Docker 镜像以及 Hugging Face 数据，构建一个可同时支持以下两种训练后端的
-> LumenRL DAPO BF16 环境：
+> 目标：在一台全新的 8 卡 AMD `gfx950` 机器上，通过在线拉取 Lumen-RL 开发分支、
+> 固定 revision 的底层依赖、固定 digest 的 Docker 镜像以及 Hugging Face 数据，构建一个
+> 可同时支持以下两种训练后端的 LumenRL DAPO BF16 环境：
 >
 > - `policy.training_backend=fsdp2`：8 卡 DP8；
 > - `policy.training_backend=megatron_native`：8 卡 DP2×TP2×PP2×CP1。
@@ -61,7 +61,7 @@ Megatron-Native:
 
 ---
 
-## 1. 固定版本与 revision
+## 1. 版本、Lumen-RL 分支与依赖 revision
 
 严格使用以下版本，不要混用其他 ROCm/PyTorch/TE wheel：
 
@@ -80,13 +80,13 @@ TransformerEngine    2.15.0.dev0+6e541a1
 Apex                 1.14.0a0
 ```
 
-固定源码 revision：
+Lumen-RL 跟踪开发分支最新 HEAD；底层依赖保持固定 revision：
 
 ```text
 Lumen-RL
   repo    https://github.com/ZhangDanyang-AMD/Lumen-RL.git
   branch  dev/vllm-fsdp-dapo
-  commit  523e92329d312a3265e0a031dd7982b0529c3ef5
+  policy  跟踪分支最新 HEAD
 
 Lumen
   repo    https://github.com/ZhangDanyang-AMD/Lumen.git
@@ -153,7 +153,7 @@ mkdir -p \
 
 ---
 
-## 3. 在线 clone 固定代码 revision
+## 3. 在线 clone Lumen-RL 分支与固定依赖
 
 所有源码均从远端仓库获取，不复制旧机器文件：
 
@@ -161,8 +161,6 @@ mkdir -p \
 git clone -b dev/vllm-fsdp-dapo \
   https://github.com/ZhangDanyang-AMD/Lumen-RL.git \
   "$RL_ROOT/Lumen-RL"
-git -C "$RL_ROOT/Lumen-RL" checkout \
-  523e92329d312a3265e0a031dd7982b0529c3ef5
 
 git clone \
   https://github.com/ZhangDanyang-AMD/Lumen.git \
@@ -182,6 +180,7 @@ git -C "$RL_ROOT/aiter" submodule update --init --recursive --jobs 16
 验证：
 
 ```bash
+git -C "$RL_ROOT/Lumen-RL" branch --show-current
 git -C "$RL_ROOT/Lumen-RL" rev-parse HEAD
 git -C "$RL_ROOT/Lumen" rev-parse HEAD
 git -C "$RL_ROOT/aiter" rev-parse HEAD
@@ -192,7 +191,17 @@ test -f "$RL_ROOT/Lumen-RL/examples/DAPO/run_dapo.sh"
 grep -q 'EXTRA_OVERRIDE' "$RL_ROOT/Lumen-RL/examples/DAPO/run_dapo.sh"
 ```
 
-期望三个 HEAD 与第 1 节完全一致，Lumen-RL `status --short` 为空。
+期望 Lumen-RL 分支为 `dev/vllm-fsdp-dapo`、`status --short` 为空；
+Lumen 与 aiter HEAD 与第 1 节固定 revision 一致。
+
+未来需要获取 Lumen-RL 分支更新时：
+
+```bash
+git -C "$RL_ROOT/Lumen-RL" pull --ff-only origin dev/vllm-fsdp-dapo
+```
+
+`--ff-only` 会在本地出现分叉或未处理改动时拒绝覆盖。不要用 `reset --hard`。
+每次构建仍应在 manifest 中记录实际 Lumen-RL HEAD，以便追溯。
 
 ---
 
@@ -802,12 +811,12 @@ PY
 
 ## 9. 生成双后端统一启动器
 
-固定 commit 中已有 `examples/DAPO/run_dapo.sh`。下面只增加一个轻量 wrapper，
+`dev/vllm-fsdp-dapo` 分支中已有 `examples/DAPO/run_dapo.sh`。下面只增加一个轻量 wrapper，
 根据 `BACKEND=fsdp2|megatron_native` 与 `RUN_KIND=smoke|longrun` 选择配置和 override。
 
 所有路径都从 `RL_ROOT`/`DATA_ROOT` 获取，不包含机器专属路径：
 
-> 固定 revision 中的 DAPO YAML 已统一使用 `${oc.env:DATA_ROOT}`，Megatron YAML 默认 backend
+> 当前分支中的 DAPO YAML 已统一使用 `${oc.env:DATA_ROOT}`，Megatron YAML 默认 backend
 > 已是 `megatron_native`。wrapper 仍显式覆盖 backend、独立 checkpoint 路径和 Megatron
 > TP/PP/CP，避免不同路线误共享状态。
 
@@ -933,7 +942,7 @@ if [ "$exit_code" -ne 0 ]; then
   exit "$exit_code"
 fi
 
-# 固定 revision 的 run_dapo.sh 会传播 trainer 退出码；同时要求成功收尾日志，
+# 当前分支的 run_dapo.sh 会传播 trainer 退出码；同时要求成功收尾日志，
 # 防止异常退出被外层调度器误判为完成。
 if ! grep -q "LumenRL finished." "$LOG"; then
   echo "ERROR: training did not reach 'LumenRL finished.'" >&2
@@ -1506,7 +1515,8 @@ policy.generation.vllm_cfg.enable_sleep_mode=false
 
 1. 固定 image digest、torch、HIP、vLLM 版本完全匹配。
 2. 容器内可见 8×`gfx950`。
-3. Lumen-RL、Lumen、aiter、ROCm TE、ROCm Apex revision 完全匹配。
+3. Lumen-RL 位于 `dev/vllm-fsdp-dapo` 最新 HEAD；Lumen、aiter、ROCm TE、ROCm Apex
+   revision 完全匹配。
 4. `megatron-core==0.18.2`，pipeline schedule 与 dist-checkpoint 可 import。
 5. Apex FusedLayerNorm/FusedAdam 前反向通过。
 6. TE 版本为 `2.15.0.dev0+6e541a1`。

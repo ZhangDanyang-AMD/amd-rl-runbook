@@ -68,7 +68,6 @@ mkdir -p "$RL_ROOT" "$DATA_ROOT/logs"
 ```bash
 cd "$RL_ROOT"
 git clone -b dev/vllm-fsdp-dapo   https://github.com/ZhangDanyang-AMD/Lumen-RL.git
-git -C Lumen-RL checkout 523e92329d312a3265e0a031dd7982b0529c3ef5
 git clone -b amd-atom-rollout     https://github.com/ZhangDanyang-AMD/Lumen.git
 git clone -b lumen/triton_kernels https://github.com/ZhangDanyang-AMD/aiter.git
 git clone -b lumen-rl             https://github.com/xysheng-AMD/ATOM.git   # 仅 MODE=atomfp8（ATOM rollout）需要
@@ -85,7 +84,6 @@ git submodule update --init --depth 1 3rdparty/composable_kernel
 cd "$RL_ROOT"
 GHP=https://gh-proxy.com/https://github.com
 git -c http.version=HTTP/1.1 clone --depth 1 --single-branch -b dev/vllm-fsdp-dapo   "$GHP/ZhangDanyang-AMD/Lumen-RL.git"
-git -C Lumen-RL checkout 523e92329d312a3265e0a031dd7982b0529c3ef5
 git -c http.version=HTTP/1.1 clone --depth 1 --single-branch -b amd-atom-rollout     "$GHP/ZhangDanyang-AMD/Lumen.git"
 git -c http.version=HTTP/1.1 clone --depth 1 --single-branch -b lumen/triton_kernels "$GHP/ZhangDanyang-AMD/aiter.git"
 git -c http.version=HTTP/1.1 clone --depth 1 --single-branch -b lumen-rl             "$GHP/xysheng-AMD/ATOM.git"
@@ -102,10 +100,16 @@ git -c http.version=HTTP/1.1 \
 
 | 仓库 | 分支 | 用途 |
 |---|---|---|
-| `Lumen-RL` | `dev/vllm-fsdp-dapo` @ `523e92329d312a3265e0a031dd7982b0529c3ef5` | RL 主框架 |
+| `Lumen-RL` | `dev/vllm-fsdp-dapo`（跟踪分支最新 HEAD） | RL 主框架 |
 | `Lumen` | `amd-atom-rollout` | FSDP2 训练后端（FP8） |
 | `aiter` | `lumen/triton_kernels` | AMD kernel |
 | `ATOM` | `lumen-rl` | **仅 `MODE=atomfp8`**：ATOM rollout 引擎；BF16/vLLM-FP8 路线不需要 |
+
+已有 checkout 获取后续 Lumen-RL 更新：
+
+```bash
+git -C "$RL_ROOT/Lumen-RL" pull --ff-only origin dev/vllm-fsdp-dapo
+```
 
 ---
 
