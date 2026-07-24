@@ -1,8 +1,8 @@
 # LumenRL DAPO 双后端新机 Runbook（FSDP2 + Megatron-Native）
 
-> 目标：在一台全新的 8 卡 AMD `gfx950` 机器上，通过在线拉取 Lumen-RL 开发分支、
-> 固定 revision 的底层依赖、固定 digest 的 Docker 镜像以及 Hugging Face 数据，构建一个
-> 可同时支持以下两种训练后端的 LumenRL DAPO BF16 环境：
+> 目标：在一台全新的 8 卡 AMD `gfx950` 机器上，通过在线拉取 Lumen-RL、Lumen、aiter
+> 开发分支，配合固定 revision 的底层二进制依赖、固定 digest 的 Docker 镜像以及
+> Hugging Face 数据，构建一个可同时支持以下两种训练后端的 LumenRL DAPO BF16 环境：
 >
 > - `policy.training_backend=fsdp2`：8 卡 DP8；
 > - `policy.training_backend=megatron_native`：8 卡 DP2×TP2×PP2×CP1。
@@ -61,7 +61,7 @@ Megatron-Native:
 
 ---
 
-## 1. 版本、Lumen-RL 分支与依赖 revision
+## 1. 版本、代码分支与底层依赖 revision
 
 严格使用以下版本，不要混用其他 ROCm/PyTorch/TE wheel：
 
@@ -80,7 +80,7 @@ TransformerEngine    2.15.0.dev0+6e541a1
 Apex                 1.14.0a0
 ```
 
-Lumen-RL 跟踪开发分支最新 HEAD；底层依赖保持固定 revision：
+Lumen-RL、Lumen、aiter 跟踪各自开发分支最新 HEAD；ROCm TE/Apex 保持固定 revision：
 
 ```text
 Lumen-RL
@@ -90,11 +90,13 @@ Lumen-RL
 
 Lumen
   repo    https://github.com/ZhangDanyang-AMD/Lumen.git
-  commit  e6379cbd9057b03c18213fbf65a4d891160545ca
+  branch  amd-atom-rollout
+  policy  跟踪分支最新 HEAD
 
 aiter
   repo    https://github.com/ZhangDanyang-AMD/aiter.git
-  commit  ff1006d03b53a693424c30e192c6e700e632bef8
+  branch  lumen/triton_kernels
+  policy  跟踪分支最新 HEAD
 
 ROCm TransformerEngine
   repo    https://github.com/ROCm/TransformerEngine.git
@@ -153,7 +155,7 @@ mkdir -p \
 
 ---
 
-## 3. 在线 clone Lumen-RL 分支与固定依赖
+## 3. 在线 clone 三个代码分支
 
 所有源码均从远端仓库获取，不复制旧机器文件：
 
@@ -162,17 +164,13 @@ git clone -b dev/vllm-fsdp-dapo \
   https://github.com/ZhangDanyang-AMD/Lumen-RL.git \
   "$RL_ROOT/Lumen-RL"
 
-git clone \
+git clone -b amd-atom-rollout \
   https://github.com/ZhangDanyang-AMD/Lumen.git \
   "$RL_ROOT/Lumen"
-git -C "$RL_ROOT/Lumen" checkout \
-  e6379cbd9057b03c18213fbf65a4d891160545ca
 
-git clone \
+git clone -b lumen/triton_kernels \
   https://github.com/ZhangDanyang-AMD/aiter.git \
   "$RL_ROOT/aiter"
-git -C "$RL_ROOT/aiter" checkout \
-  ff1006d03b53a693424c30e192c6e700e632bef8
 git -C "$RL_ROOT/aiter" submodule sync --recursive
 git -C "$RL_ROOT/aiter" submodule update --init --recursive --jobs 16
 ```
@@ -181,23 +179,30 @@ git -C "$RL_ROOT/aiter" submodule update --init --recursive --jobs 16
 
 ```bash
 git -C "$RL_ROOT/Lumen-RL" branch --show-current
+git -C "$RL_ROOT/Lumen" branch --show-current
+git -C "$RL_ROOT/aiter" branch --show-current
 git -C "$RL_ROOT/Lumen-RL" rev-parse HEAD
 git -C "$RL_ROOT/Lumen" rev-parse HEAD
 git -C "$RL_ROOT/aiter" rev-parse HEAD
 git -C "$RL_ROOT/Lumen-RL" status --short
+git -C "$RL_ROOT/Lumen" status --short
+git -C "$RL_ROOT/aiter" status --short
 
 test -f "$RL_ROOT/Lumen-RL/lumenrl/engine/training/megatron_native_engine.py"
 test -f "$RL_ROOT/Lumen-RL/examples/DAPO/run_dapo.sh"
 grep -q 'EXTRA_OVERRIDE' "$RL_ROOT/Lumen-RL/examples/DAPO/run_dapo.sh"
 ```
 
-期望 Lumen-RL 分支为 `dev/vllm-fsdp-dapo`、`status --short` 为空；
-Lumen 与 aiter HEAD 与第 1 节固定 revision 一致。
+期望分支分别为 `dev/vllm-fsdp-dapo`、`amd-atom-rollout`、`lumen/triton_kernels`，
+三个仓库的 `status --short` 均为空。
 
-未来需要获取 Lumen-RL 分支更新时：
+未来需要获取代码分支更新时：
 
 ```bash
 git -C "$RL_ROOT/Lumen-RL" pull --ff-only origin dev/vllm-fsdp-dapo
+git -C "$RL_ROOT/Lumen" pull --ff-only origin amd-atom-rollout
+git -C "$RL_ROOT/aiter" pull --ff-only origin lumen/triton_kernels
+git -C "$RL_ROOT/aiter" submodule update --init --recursive --jobs 16
 ```
 
 `--ff-only` 会在本地出现分叉或未处理改动时拒绝覆盖。不要用 `reset --hard`。
@@ -1515,8 +1520,7 @@ policy.generation.vllm_cfg.enable_sleep_mode=false
 
 1. 固定 image digest、torch、HIP、vLLM 版本完全匹配。
 2. 容器内可见 8×`gfx950`。
-3. Lumen-RL 位于 `dev/vllm-fsdp-dapo` 最新 HEAD；Lumen、aiter、ROCm TE、ROCm Apex
-   revision 完全匹配。
+3. Lumen-RL、Lumen、aiter 位于指定分支最新 HEAD；ROCm TE、ROCm Apex revision 完全匹配。
 4. `megatron-core==0.18.2`，pipeline schedule 与 dist-checkpoint 可 import。
 5. Apex FusedLayerNorm/FusedAdam 前反向通过。
 6. TE 版本为 `2.15.0.dev0+6e541a1`。

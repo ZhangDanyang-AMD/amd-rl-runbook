@@ -105,10 +105,13 @@ git -c http.version=HTTP/1.1 \
 | `aiter` | `lumen/triton_kernels` | AMD kernel |
 | `ATOM` | `lumen-rl` | **仅 `MODE=atomfp8`**：ATOM rollout 引擎；BF16/vLLM-FP8 路线不需要 |
 
-已有 checkout 获取后续 Lumen-RL 更新：
+已有 checkout 获取后续代码分支更新：
 
 ```bash
 git -C "$RL_ROOT/Lumen-RL" pull --ff-only origin dev/vllm-fsdp-dapo
+git -C "$RL_ROOT/Lumen" pull --ff-only origin amd-atom-rollout
+git -C "$RL_ROOT/aiter" pull --ff-only origin lumen/triton_kernels
+git -C "$RL_ROOT/aiter" submodule update --init --depth 1 3rdparty/composable_kernel
 ```
 
 ---
