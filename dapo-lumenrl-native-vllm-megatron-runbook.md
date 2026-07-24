@@ -26,6 +26,11 @@
 >
 > ℹ️ 运行时用 **Megatron local spec + torch RMSNorm**(非 TE),**不依赖 apex / Transformer Engine**;只装
 > `megatron-core` 即可(自动回退 torch norm / torch 优化器)。长序列注意力用容器自带 `flash_attn`(§7.1),同样**无需 TE**。
+>
+> ⚠️ 本文档保留的是 legacy `backend="megatron"` 路线。固定 revision 中的 Megatron YAML
+> 已默认使用 `megatron_native`；本文所有启动命令都显式传
+> `policy.training_backend=megatron`。新部署优先使用
+> `dapo-lumenrl-vllm-fsdp-megatron-new-machine-runbook.md`。
 
 ---
 
@@ -38,12 +43,13 @@
 | 并行 | FSDP2 参数分片,DP=8 | **TP=1 / PP=1 / CP=1 / DP=8**;`use_distributed_optimizer=True`(优化器状态分片到 DP) |
 | 梯度同步 | FSDP2 reduce-scatter | **Megatron DDP grad buffer + `finalize_model_grads`**(DP mean) |
 | logprob / 训练前向 | packed varlen（HF attn） | **每序列单条前向**（GPTModel,causal;engine-level `compute_log_probs`/`update_policy`） |
-| 推理后端 | vLLM `AsyncLLM`（colocated,TP=1） | **同**(训练时 `enable_sleep_mode` 让出显存) |
+| 推理后端 | vLLM `AsyncLLM`（colocated,TP=1） | **同**（`enable_sleep_mode=false`，训练期间保持常驻） |
 | 权重同步 | DTensor all-gather → ZMQ CUDA-IPC | **Megatron→HF 名称转换** → ZMQ CUDA-IPC（同 receiver） |
 | 损失 / 优势 / TIS | `asymmetric_clip_loss` + grpo + token-mean + TIS | **同**（engine 复用同一套 loss/meta 契约） |
 
-后端选择只由 config 的 `policy.training_backend` 决定:`fsdp2` → FSDP2Engine;`megatron` → 本 runbook 的
-`MegatronEngine`(已注册 `backend="megatron"`,`actor_worker` 自动委托 engine-level 计算)。
+后端选择只由 config 的 `policy.training_backend` 决定：`fsdp2` → FSDP2Engine；
+`megatron_native` → TE 原生引擎；`megatron` → 本 runbook 的 legacy `MegatronEngine`
+(已注册 `backend="megatron"`,`actor_worker` 自动委托 engine-level 计算)。
 
 > 代码全部在 `Lumen-RL` 仓库内(见 §3 分支)。Megatron 后端相关文件:
 > `lumenrl/engine/training/megatron_engine.py`、`lumenrl/engine/training/qwen3_megatron_bridge.py`、
@@ -70,6 +76,7 @@ mkdir -p "$RL_ROOT" "$DATA_ROOT/logs"
 cd "$RL_ROOT"
 # Lumen-RL：dev/vllm-fsdp-dapo 分支已包含 Megatron 训练后端（VIME-style GPTModel）
 git clone -b dev/vllm-fsdp-dapo   https://github.com/ZhangDanyang-AMD/Lumen-RL.git
+git -C Lumen-RL checkout 523e92329d312a3265e0a031dd7982b0529c3ef5
 git clone -b amd-atom-rollout     https://github.com/ZhangDanyang-AMD/Lumen.git
 git clone -b lumen/triton_kernels https://github.com/ZhangDanyang-AMD/aiter.git
 
@@ -84,6 +91,7 @@ git submodule update --init --depth 1 3rdparty/composable_kernel
 cd "$RL_ROOT"
 GHP=https://gh-proxy.com/https://github.com
 git -c http.version=HTTP/1.1 clone --depth 1 --single-branch -b dev/vllm-fsdp-dapo   "$GHP/ZhangDanyang-AMD/Lumen-RL.git"
+git -C Lumen-RL checkout 523e92329d312a3265e0a031dd7982b0529c3ef5
 git -c http.version=HTTP/1.1 clone --depth 1 --single-branch -b amd-atom-rollout     "$GHP/ZhangDanyang-AMD/Lumen.git"
 git -c http.version=HTTP/1.1 clone --depth 1 --single-branch -b lumen/triton_kernels "$GHP/ZhangDanyang-AMD/aiter.git"
 cd "$RL_ROOT/aiter"
@@ -93,7 +101,7 @@ git -c http.version=HTTP/1.1 -c url."$GHP/".insteadOf=https://github.com/ \
 
 | 仓库 | 分支 | 用途 |
 |---|---|---|
-| `Lumen-RL` | `dev/vllm-fsdp-dapo` | RL 主框架 **+ Megatron 训练后端** |
+| `Lumen-RL` | `dev/vllm-fsdp-dapo` @ `523e92329d312a3265e0a031dd7982b0529c3ef5` | RL 主框架 **+ Megatron 训练后端** |
 | `Lumen` | `amd-atom-rollout` | Lumen 库（rollout/工具依赖） |
 | `aiter` | `lumen/triton_kernels` | AMD kernel（vLLM/训练用） |
 
@@ -252,8 +260,8 @@ smoke = FSDP 的 `dapo_qwen3_8b_ray_vllm_smoke.yaml` 复制版;longrun = FSDP `.
 
 | 项 | 值 |
 |---|---|
-| `policy.training_backend` | **`megatron`**（触发 MegatronEngine） |
-| `policy.generation.vllm_cfg.enable_sleep_mode` / `sleep_level` | **`true`** / `2`（训练时休眠 vLLM 让出显存） |
+| `policy.training_backend` | YAML 默认 `megatron_native`；本文命令显式覆盖为 **`megatron`**（触发 legacy MegatronEngine） |
+| `policy.generation.vllm_cfg.enable_sleep_mode` | **`false`**（ROCm 7.2.3 sleep/wake 不可靠） |
 | `policy.training.megatron_cfg` | 见下（分布式优化器 + 长序列显存开关） |
 
 smoke 规模:resp=512、`train_global_batch_size=128`(8×16)、`gen_batch_size=24`、`num_generations=16`、
@@ -314,6 +322,7 @@ ENVX="export RL_ROOT='$RL_ROOT' DATA_ROOT='$DATA_ROOT';"   # 显式注入，避�
 
 sudo docker exec "$CONTAINER" bash -lc "$ENVX \
   CONFIG_OVERRIDE=examples/DAPO/configs/dapo_qwen3_8b_ray_megatron_smoke.yaml \
+  EXTRA_OVERRIDE='policy.training_backend=megatron' \
   STEPS=1 MODE=bf16 LOG=$DATA_ROOT/logs/smoke-megatron.log bash '$S'; \
   tail -60 \"\$(cat /tmp/run_dapo_log.txt)\""
 ```
@@ -334,6 +343,7 @@ sudo docker exec "$CONTAINER" bash -lc "$ENVX \
 ```bash
 sudo docker exec "$CONTAINER" bash -lc "$ENVX \
   CONFIG_OVERRIDE=examples/DAPO/configs/dapo_qwen3_8b_ray_megatron_smoke.yaml \
+  EXTRA_OVERRIDE='policy.training_backend=megatron' \
   STEPS=8 MODE=bf16 LOG=$DATA_ROOT/logs/smoke-megatron-8step.log bash '$S'"
 sudo docker exec "$CONTAINER" bash -lc 'L=$(cat /tmp/run_dapo_log.txt); grep -aE "callbacks: step=" "$L" | tail -8'
 ```
@@ -347,6 +357,7 @@ S=$RL_ROOT/Lumen-RL/examples/DAPO/run_dapo.sh
 ENVX="export RL_ROOT='$RL_ROOT' DATA_ROOT='$DATA_ROOT';"
 sudo docker exec -d "$CONTAINER" bash -lc "$ENVX \
   CONFIG_OVERRIDE=examples/DAPO/configs/dapo_qwen3_8b_ray_megatron_longrun.yaml \
+  EXTRA_OVERRIDE='policy.training_backend=megatron' \
   STEPS=1000 MODE=bf16 bash '$S'"
 # W&B（可选）：把 key 放 $RL_ROOT/wandb.key（格式 WANDB_API_KEY=xxxx），脚本自动读
 ```
@@ -433,4 +444,5 @@ Megatron local attention 的 O(L²) 分数矩阵 + 完整 [L,V] `log_softmax` �
   (GQA 交织 `linear_qkv`、融合 `linear_fc1=[gate;up]`、per-head q/k norm)。
 - `lumenrl/workers/actor_worker.py`:`compute_log_probs` / `update_policy` 检测到 engine 暴露 `engine_*` 时委托给
   engine(Megatron 走 GPTModel 前向/反向;FSDP 路线不受影响)。
-- `examples/DAPO/configs/dapo_qwen3_8b_ray_megatron_smoke.yaml`:`training_backend: megatron` + vLLM sleep。
+- `examples/DAPO/configs/dapo_qwen3_8b_ray_megatron_smoke.yaml` 默认
+  `training_backend: megatron_native`；本文启动命令显式覆盖为 `megatron`。
