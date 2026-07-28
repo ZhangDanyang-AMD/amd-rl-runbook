@@ -593,9 +593,9 @@ checkpoint_NNNNN.pt
 After training, convert the LumenRL checkpoint to HF-compatible safetensors:
 ```bash
 python output/export_dspark_hf.py \
-    --checkpoint /dev/shm/checkpoints/kimi_k3_dspark_vllm/checkpoint_BEST.pt \
-    --target-model /dev/shm/Kimi-K3 \
-    --output-dir /dev/shm/Kimi-K3-DSpark-trained
+    --ckpt /dev/shm/checkpoints/kimi_k3_dspark_vllm/checkpoint_BEST.pt \
+    --base-model /dev/shm/Kimi-K3 \
+    --output /dev/shm/Kimi-K3-DSpark-trained
 
 # Weight key mapping (MLA-native, no conversion needed):
 #   fc.weight → fc.weight
@@ -640,11 +640,13 @@ for round in range(num_rounds):
 ### NVMe Cache Format
 
 Each batch stored in `{cache_dir}/round_{r}/batch_{b}/`:
-- `hidden_states.bin` — `[B, T, 5*7168]` bf16 (~5.5 GB for B=8, T=8192)
+- `hidden_states.bin` — `[B, T, 4*7168]` bf16 (first 4 aux layers, ~4.4 GB for B=8, T=8192)
 - `token_embeds.bin` — `[B, T, 7168]` bf16
-- `last_hidden_states.bin` — `[B, T, 7168]` bf16
+- `last_hidden_states.bin` — `[B, T, 7168]` bf16 (5th aux layer, separated by vLLM)
 - `input_ids.bin`, `attention_mask.bin`, `loss_mask.bin` — int64
 - `meta.pt` — shape metadata
+
+Note: With `separate_last_hidden: true`, `hidden_states` contains 4 layers (28672 dim) and `last_hidden_states` contains the 5th layer (7168 dim). The trainer concatenates them to `[B,T,35840]` before passing to DSpark's `fc` layer. The `last_hidden_states` is also RMSNorm'd separately and used as `target_hidden_states` for the L1/confidence losses.
 
 Total per round: ~200 batches × ~5.6 GB ≈ **1.1 TB**. Ensure cache_dir has sufficient NVMe space.
 
@@ -664,16 +666,55 @@ On GPU reload:
 
 **Critical:** `nn.Module.to()` creates new tensor objects. The BF16Optimizer's `model_params` list must be rebuilt to point to the new GPU-resident parameters, otherwise the optimizer step copies gradients to stale CPU references.
 
+## Real-Time Eval During Training
+
+### How It Works
+
+Eval is built into the batch-alternating training loop via `EvalCallback`:
+
+1. **Startup**: `_build_eval_teacher_cache()` runs the teacher on `num_samples` held-out sequences and caches the hidden states on **CPU**. This happens once, before the first Phase A/B round.
+2. **Every `interval` steps**: `EvalCallback.on_step_end()` calls `run_validation()`, which runs the DSpark draft model on the cached teacher outputs — no GPU-side teacher inference needed.
+3. **Survives vLLM shutdown**: Since the eval cache is on CPU, it persists across Phase A→B transitions.
+
+### Config
+
+```yaml
+# train.yaml (full training)
+eval:
+  enabled: true
+  interval: 500        # eval every 500 steps
+  num_samples: 256     # 256 held-out sequences
+  micro_batch_size: 4
+
+# smoke_test.yaml (5-step validation)
+eval:
+  enabled: true
+  interval: 1          # eval every step
+  num_samples: 8
+  micro_batch_size: 2
+```
+
+### Eval Metrics
+
+| Metric | Description | Target |
+|--------|-------------|--------|
+| `eval/step_{i}_acc` | Top-1 accuracy at position i (0..6) | pos 0 > 60%, pos 6 > 5% |
+| `eval/step_{i}_loss` | Cross-entropy loss at position i | Decreasing |
+| `eval/loss` | Weighted aggregate (decay_gamma=4.0) | Decreasing |
+| `eval/simulated_acc_len` | Σ(∏ acc[0..i]) — predicted accept length | ≥ 3.0 |
+
+`simulated_acc_len` is the most important metric — it directly predicts the speculative decoding speedup. A value of 3.0 means each draft call accepts ~3 tokens on average.
+
 ## Benchmarking
 
 ### Using the Benchmark Script
 
 ```bash
 # Export trained checkpoint to HF format first
-python examples/Kimi_K3_SDDD_MI350_vllm/export_dspark_hf.py \
-    --checkpoint /dev/shm/checkpoints/kimi_k3_dspark_vllm/checkpoint_59630.pt \
-    --target-model /dev/shm/Kimi-K3 \
-    --output-dir /dev/shm/Kimi-K3-DSpark-trained
+python output/export_dspark_hf.py \
+    --ckpt /dev/shm/checkpoints/kimi_k3_dspark_vllm/checkpoint_59630.pt \
+    --base-model /dev/shm/Kimi-K3 \
+    --output /dev/shm/Kimi-K3-DSpark-trained
 
 # Run full benchmark (DSpark speculative decoding vs baseline)
 bash output/benchmark_dspark.sh \
@@ -855,9 +896,10 @@ bash examples/Kimi_K3_SDDD_MI350_vllm/run_kimi_k3.sh --smoke-test
 
 3. **Hidden state shapes (verify on first batch):**
    ```
-   hidden_states: [8, T, 35840]  # 5 × 7168
-   last_hidden_states: [8, T, 7168]
+   hidden_states: [8, T, 28672]  # 4 × 7168 (first 4 aux layers)
+   last_hidden_states: [8, T, 7168]  # 5th aux layer (separate)
    ```
+   Note: With `separate_last_hidden: true`, vLLM puts the first 4 aux layers in `hidden_states` and the 5th in `last_hidden_states`. The trainer concatenates them back to `[B, T, 35840]` before passing to DSpark model's `fc` layer.
 
 4. **Phase B start:**
    ```
@@ -872,7 +914,13 @@ bash examples/Kimi_K3_SDDD_MI350_vllm/run_kimi_k3.sh --smoke-test
      step_0_acc=0.XX ... step_6_acc=0.XX
    ```
 
-6. **Completion:**
+6. **Eval metrics (every step in smoke test, every 500 steps in full training):**
+   ```
+   eval step=1 eval/loss=X.XXXX eval/simulated_acc_len=X.XX eval/step_0_acc=X.XX eval/step_1_acc=X.XX ...
+   ```
+   The eval teacher cache is built once at startup (on CPU) and survives vLLM shutdown cycles. `simulated_acc_len` is the cumulative product of per-position accuracies — it directly predicts speculative decoding throughput.
+
+7. **Completion:**
    ```
    Batch-alternating training finished after 5 steps.
    SpecDistillTrainer.cleanup complete.
@@ -921,10 +969,10 @@ When training converges (accept_len ≥ 3.0):
 ls -la /dev/shm/checkpoints/kimi_k3_dspark_vllm/
 
 # 2. Export to HF format
-python examples/Kimi_K3_SDDD_MI350_vllm/export_dspark_hf.py \
-    --checkpoint /dev/shm/checkpoints/kimi_k3_dspark_vllm/checkpoint_BEST.pt \
-    --target-model /dev/shm/Kimi-K3 \
-    --output-dir /dev/shm/Kimi-K3-DSpark-trained
+python output/export_dspark_hf.py \
+    --ckpt /dev/shm/checkpoints/kimi_k3_dspark_vllm/checkpoint_BEST.pt \
+    --base-model /dev/shm/Kimi-K3 \
+    --output /dev/shm/Kimi-K3-DSpark-trained
 
 # 3. Validate with benchmark
 bash output/benchmark_dspark.sh \
@@ -1065,6 +1113,41 @@ Both LumenRL and TorchSpec use **dual-source KV injection**:
 | loss_decay_gamma | 4.0 | 4.0 | Aligned |
 | num_anchors | 512 | 512 | Aligned |
 | block_size | 7 | 7 | Aligned |
+
+## Verified End-to-End Flow (2026-07-28)
+
+Full pipeline verified — no bugs found in any step:
+
+| Step | Status | Detail |
+|------|--------|--------|
+| Data loading (`kimi-k3` → KimiK25Parser) | PASS | `_init_worker()` correctly routes `kimi-k3` to KimiK25Parser |
+| Config (`SpecDistillConfig` + `DraftModelConfig`) | PASS | All YAML fields map to dataclass fields |
+| DSpark model construction | PASS | `fc = nn.Linear(5*7168, 7168)` matches 5 aux layers |
+| vLLM hidden state extraction | PASS | `aux_layer_ids=[2,23,47,71,89]`, split into 4+1 |
+| `separate_last_hidden` concatenation | PASS | Pre-norm rejoin in `_train_step_dspark()` + `run_validation()` |
+| Batch-alternating disk cache | PASS | `_TEACHER_KEYS` includes `last_hidden_states` |
+| Eval during training | PASS | `EvalCallback` fires in batch-alternating, CPU-cached teacher data |
+| Export weight keys | PASS | All 18+ key patterns match 1:1 between model and export script |
+| Export config.json | PASS | Field-for-field identical to `Inferact/Kimi-K3-DSpark/config.json` |
+| Benchmark speculative config | PASS | Matches Inferact model card usage example exactly |
+
+### Key Implementation Detail: `separate_last_hidden`
+
+With `separate_last_hidden: true`, vLLM splits the 5 aux layers:
+- `hidden_states`: first 4 layers → `[B, T, 4*7168=28672]`
+- `last_hidden_states`: 5th layer → `[B, T, 7168]`
+
+The trainer concatenates them before passing to DSpark's `fc` layer:
+```python
+# _train_step_dspark() — pre-norm concatenation
+if spec_cfg.separate_last_hidden:
+    aux_hidden = torch.cat([aux_hidden, target_hs], dim=-1)  # → [B,T,35840]
+# Then apply RMSNorm to target_hs for L1 loss (post-norm)
+```
+
+This ensures:
+- `aux_hidden_states` (all 5 layers, pre-norm) → `fc` → context features for dual-source KV
+- `target_hidden_states` (5th layer, post-norm) → `lm_head` → target logits for L1/confidence loss
 
 ## Reference
 
