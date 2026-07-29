@@ -465,164 +465,67 @@ BF16 vs FP8 的差异(仅两处):
 
 ## 8. 统一启动脚本（BF16/FP8/smoke/长跑 一个脚本）
 
-启动脚本 **已在 Lumen-RL 仓库内**:`examples/DAPO/run_dapo.sh`(`git clone` 即得)。用 `MODE`(bf16|fp8|atomfp8)、
-`TRAIN_FP8`(0|1)、`STEPS` 控制,**没有重复的 env 块**;所有路径走 `$RL_ROOT`/`$DATA_ROOT` 变量+仓库标准布局
-自动定位,**无任何机器专属路径**。内容如下(若仓库缺失可用此 heredoc 重建):
+启动脚本 **已在 Lumen-RL 仓库内**:`examples/DAPO/run_dapo.sh`(`git clone` 即得)。用 `MODE`
+(bf16|fp8|atomfp8|atombf16)、`TRAIN_FP8`(0|1)、`STEPS` 控制,**没有重复的 env 块**;所有路径走
+`$RL_ROOT`/`$DATA_ROOT` 变量+仓库标准布局自动定位,**无任何机器专属路径**。
+
+> ⚠️ **本 runbook 不再内嵌 `run_dapo.sh` 副本**。这里曾放过一段 heredoc 用于"重建脚本",结果与仓库
+> HEAD 漂移了 117 行:丢掉 `atombf16` 模式与 `EXTRA_OVERRIDE`,多带一套仓库已移除的 `CKPT_DIR`
+> 逻辑,并且会把已修好的 `TORCHDYNAMO_DISABLE` / `PYTORCH_CUDA_ALLOC_CONF` 行为**写回旧版**。
+> **以仓库文件为唯一来源**;脚本被误改就还原它:
+>
+> ```bash
+> git -C "$RL_ROOT/Lumen-RL" checkout -- examples/DAPO/run_dapo.sh
+> ```
+
+脚本的启动开关全部通过环境变量给,**不需要改脚本内容**:
+
+| 变量 | 默认 | 作用 |
+|---|---|---|
+| `MODE` | `bf16` | `bf16` / `fp8` / `atomfp8` / `atombf16`:选 config + rollout 引擎与精度 |
+| `TRAIN_FP8` | `0` | `1` = 训练侧 Lumen FP8 blockwise2d(自动带 `FP8_PARAM_MANAGER=0`) |
+| `STEPS` | `1000` | 覆盖 `num_training_steps` |
+| `CONFIG_OVERRIDE` | 按 `MODE` 推导 | 直接指定 config 路径。**smoke 必须用它**(见 §9) |
+| `EXTRA_OVERRIDE` | 空 | 追加任意 Hydra 覆盖,空格分隔。例:`"checkpointing.save_steps=10 checkpointing.save_total_limit=2"` |
+| `LOG` | `$DATA_ROOT/logs/$RUN_ID.log` | 日志路径;脚本同时把它写进 `/tmp/run_dapo_log.txt` |
+| `MODEL_PATH` / `TRAIN_FILE` / `VAL_FILE` | `$DATA_ROOT/...` 标准布局 | 换模型/数据集 |
+| `PYTORCH_CUDA_ALLOC_CONF` | `expandable_segments:True` | **本平台建议启动时置空**,见下 |
+| `ATOM_TORCH_COMPILE_CACHE_ROOT` | `/tmp/atom_torch_compile_cache` | 每 replica 独立 compile cache 根目录 |
+
+> checkpoint 目录**由 config 的 `checkpointing.checkpoint_dir` 决定**(脚本不再覆盖它);要换位置或
+> 改落盘频率用 `EXTRA_OVERRIDE`。`save_steps` 小(如 10)时注意磁盘:8B FSDP2 单个 checkpoint 约 90GB。
+
+**`PYTORCH_CUDA_ALLOC_CONF` 建议启动时置空**:ROCm/HIP allocator **不支持** `expandable_segments`,
+留默认值只会让每个 actor 刷 `expandable_segments not supported on this platform` 警告(实测一次
+smoke 25 条)。脚本用 `${VAR-default}` 判定,所以"显式传空值"算已设置并会被 `unset`:
 
 ```bash
-cat > "$RL_ROOT/Lumen-RL/examples/DAPO/run_dapo.sh" <<'EOF'
-#!/usr/bin/env bash
-# 统一 DAPO 启动：MODE=bf16|fp8|atomfp8, TRAIN_FP8=0|1, STEPS=N。路径取容器内 $RL_ROOT/$DATA_ROOT。
-set -uo pipefail
-: "${RL_ROOT:?}"; : "${DATA_ROOT:?}"
-MODE="${MODE:-bf16}"; TRAIN_FP8="${TRAIN_FP8:-0}"; STEPS="${STEPS:-1000}"
-MODEL_PATH="${MODEL_PATH:-$DATA_ROOT/models/Qwen3-8B-Base}"
-TRAIN_FILE="${TRAIN_FILE:-$DATA_ROOT/data_cached/qwen3-8b-maxprompt1024/dapo-math-17k.filtered.parquet}"
-VAL_FILE="${VAL_FILE:-$DATA_ROOT/data_cached/qwen3-8b-maxprompt1024/aime-2024.filtered.parquet}"
-RUN_ID="${RUN_ID:-${MODE}$([ "$TRAIN_FP8" = 1 ] && echo -e2e)-ray-vllm-8b-$(date +%Y%m%d-%H%M%S)}"
-LOG="${LOG:-$DATA_ROOT/logs/${RUN_ID}.log}"
-USER_PYTHONPATH="${PYTHONPATH:-}"
-# 仓库定位：标准 clone 布局 $RL_ROOT/<repo>，回退到 Lumen-RL/third_party/<repo>（无机器专属路径）。
-LUMEN_DIR="${LUMEN_DIR:-$RL_ROOT/Lumen}"
-if [ ! -f "$LUMEN_DIR/lumen/config.py" ]; then
-  LUMEN_DIR="$RL_ROOT/Lumen-RL/third_party/Lumen"
-fi
-AITER_DIR="${AITER_DIR:-$RL_ROOT/aiter}"
-if [ ! -d "$AITER_DIR/aiter" ]; then
-  AITER_DIR="$RL_ROOT/Lumen-RL/third_party/aiter"
-fi
-ATOM_DIR="${ATOM_DIR:-$RL_ROOT/ATOM}"
-if [ ! -f "$ATOM_DIR/atom/rollout/async_engine.py" ]; then
-  ATOM_DIR="$RL_ROOT/Lumen-RL/third_party/ATOM"
-fi
-# Checkpoint dir is STABLE per-mode (no timestamp) so resume works across relaunches.
-CKPT_DIR="${CKPT_DIR:-$DATA_ROOT/ckpts/lumenrl-dapo/${MODE}$([ "$TRAIN_FP8" = 1 ] && echo -e2e)-ray-vllm-8b}"
-cd "$RL_ROOT/Lumen-RL"
-
-# ---- 通用 env（BF16/FP8/ATOM 共用）----
-export PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=false TORCHDYNAMO_DISABLE=1 HYDRA_FULL_ERROR=1
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True NCCL_TIMEOUT=7200 NCCL_CUMEM_ENABLE=0
-export HIP_FORCE_DEV_KERNARG=1 HSA_NO_SCRATCH_RECLAIM=1 HSA_DISABLE_FRAGMENT_ALLOCATOR=1 CUDA_DEVICE_MAX_CONNECTIONS=1
-export VLLM_USE_V1=1 VLLM_ENABLE_V1_MULTIPROCESSING=1 VLLM_LOGGING_LEVEL=WARN ATOM_DISABLE_VLLM_PLUGIN=1
-export RAY_DEDUP_LOGS=0 RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
-export LUMEN_DISABLE_HF_ATTN_PATCH=1 MODEL_NAME="$MODEL_PATH"
-export HF_HOME="$DATA_ROOT/hf_home" WANDB_DIR="$DATA_ROOT/wandb" LUMENRL_LOG_LEVEL=INFO
-export PYTHONPATH="$RL_ROOT/Lumen-RL:$AITER_DIR:$LUMEN_DIR:$ATOM_DIR:${PYTHONPATH:-}"
-for _wandb_key in "$RL_ROOT/wandb.key" "$RL_ROOT/../wandb.key"; do
-  if [ -z "${WANDB_API_KEY:-}" ] && [ -f "$_wandb_key" ]; then
-    export WANDB_API_KEY="$(cut -d= -f2- "$_wandb_key" | tr -d '[:space:]')"
-  fi
-done
-
-EXTRA_ARGS=()
-if [ "$MODE" = "atomfp8" ] || [ "$MODE" = "atom_fp8" ]; then
-  if [ "${ATOM_DEBUG:-0}" = "1" ]; then
-    CONFIG=examples/DAPO/configs/dapo_qwen3_8b_ray_atom_fp8_debug.yaml
-  else
-    CONFIG=examples/DAPO/configs/dapo_qwen3_8b_ray_atom_fp8_longrun.yaml
-  fi
-  ATOM_ONLINE_QUANT="${ATOM_ONLINE_QUANT:-per_block_fp8}"
-  unset ATOM_DISABLE_VLLM_PLUGIN
-  export LUMENRL_ATOM_AITER_SRC="${LUMENRL_ATOM_AITER_SRC:-$AITER_DIR}"
-  export PYTHONPATH="$RL_ROOT/Lumen-RL/examples/DAPO/atom_aiter_shim:$RL_ROOT/Lumen-RL:$AITER_DIR:$LUMEN_DIR:$ATOM_DIR:$USER_PYTHONPATH"
-  # ATOM FP8 正式方案：no-eager + level=3。每个 colocated replica 独立
-  # torch compile cache，避免 8 个 rank0 同时写同一路径导致 Inductor rename race。
-  export TORCHDYNAMO_DISABLE=0 ATOM_ISOLATE_TORCH_COMPILE_CACHE=1
-  export ATOM_TORCH_COMPILE_CACHE_ROOT="${ATOM_TORCH_COMPILE_CACHE_ROOT:-/tmp/atom_torch_compile_cache}"
-  export VLLM_ROCM_USE_AITER=0 VLLM_ROCM_USE_AITER_MHA=0 VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION=0 VLLM_ROCM_USE_AITER_LINEAR=0
-  # 训练侧与 vLLM fp8 完全一致（Lumen FP8 blockwise2d + norm）；rollout 换成 ATOM per-block FP8。
-  unset LUMEN_ROLLOUT
-  export LUMEN_DISABLE_HF_ATTN_PATCH=1 LUMEN_NORM=1
-  if [ "$TRAIN_FP8" = "1" ]; then
-    export LUMEN_FP8=1 FP8_PARAM_MANAGER=0
-    export LUMEN_FP8_SCALING=blockwise2d LUMEN_FP8_FORMAT=fp8_e4m3 LUMEN_FP8_BLOCK_SIZE=128
-    export LUMEN_FP8_ATTN=none LUMEN_FP8_QUANT_TYPE=blockwise LUMEN_ATTN_BACKEND=auto
-    export LUMEN_FP8_WGRAD="${LUMEN_FP8_WGRAD:-0}"
-  fi
-  EXTRA_ARGS+=(
-    policy.generation.atom_cfg.online_quant_config.global_quant_config="$ATOM_ONLINE_QUANT"
-    policy.generation.vllm_cfg.enforce_eager=false
-    policy.generation.atom_cfg.engine_kwargs.enforce_eager=false
-    policy.generation.atom_cfg.engine_kwargs.compilation_config.level=3
-    policy.generation.vllm_cfg.enable_sleep_mode=true
-    policy.generation.vllm_cfg.sleep_level=2
-  )
-elif [ "$MODE" = "fp8" ]; then
-  CONFIG=examples/DAPO/configs/dapo_qwen3_8b_ray_vllm_fp8_longrun.yaml
-  # rollout per_block_fp8 + AITER unified attention
-  export LUMENRL_FP8_PER_BLOCK=1
-  export VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_AITER_MHA=1 VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION=1 VLLM_ROCM_USE_AITER_LINEAR=0
-  if [ "$TRAIN_FP8" = "1" ]; then    # FP8 E2E 训练（blockwise2d，param manager 必须关）
-    export LUMEN_FP8=1 FP8_PARAM_MANAGER=0 LUMEN_NORM=1
-    export LUMEN_FP8_SCALING=blockwise2d LUMEN_FP8_FORMAT=fp8_e4m3 LUMEN_FP8_BLOCK_SIZE=128 LUMEN_FP8_ATTN=none
-  fi
-else
-  CONFIG=examples/DAPO/configs/dapo_qwen3_8b_ray_vllm_longrun.yaml
-  export VLLM_ROCM_USE_AITER=0 VLLM_ROCM_USE_AITER_MHA=0 VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION=0 VLLM_ROCM_USE_AITER_LINEAR=0
-fi
-CONFIG="${CONFIG_OVERRIDE:-$CONFIG}"
-
-echo "$LOG" > /tmp/run_dapo_log.txt
-echo "=== MODE=$MODE TRAIN_FP8=$TRAIN_FP8 STEPS=$STEPS  CONFIG=$CONFIG  CKPT=$CKPT_DIR  LOG=$LOG ==="
-
-# 清理旧进程（含 ATOM/vLLM ray server 与孤儿 EngineCore）
-ray stop --force >/dev/null 2>&1 || true
-python3 - <<'PY'
-import os
-import signal
-import subprocess
-
-patterns = (
-    "lumenrl.trainer.main",
-    "VLLMRayServer",
-    "ATOMRayServer",
-    "VLLM::EngineCore",
-    "EngineCore",
-    "spawn_main",
-    "torch/_inductor/compile_worker",
-    "multiprocessing.resource_tracker",
-)
-skip = {os.getpid(), os.getppid()}
-out = subprocess.check_output(["ps", "-eo", "pid,ppid,stat,cmd"], text=True)
-for line in out.splitlines()[1:]:
-    parts = line.strip().split(None, 3)
-    if len(parts) < 4:
-        continue
-    pid = int(parts[0])
-    stat = parts[2]
-    cmd = parts[3]
-    if pid in skip or "Z" in stat:
-        continue
-    if any(p in cmd for p in patterns):
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-PY
-sleep 8
-
-python3 -u -m lumenrl.trainer.main --config "$CONFIG" \
-  policy.model_name="$MODEL_PATH" reward.dataset="$TRAIN_FILE" val_dataset="$VAL_FILE" \
-  checkpointing.checkpoint_dir="$CKPT_DIR" \
-  num_training_steps="$STEPS" seed=10086 "${EXTRA_ARGS[@]}" > "$LOG" 2>&1
-exit_code=$?
-echo "=== exit=$exit_code ==="
-exit "$exit_code"
-EOF
-chmod +x "$RL_ROOT/Lumen-RL/examples/DAPO/run_dapo.sh"
+PYTORCH_CUDA_ALLOC_CONF= STEPS=1000 MODE=atomfp8 TRAIN_FP8=1 \
+  bash "$RL_ROOT/Lumen-RL/examples/DAPO/run_dapo.sh"
 ```
+
+**`TORCHDYNAMO_DISABLE` 不要手工设置**。脚本全局保持 `=1`(训练 actor 关 dynamo);`MODE=atomfp8`
+的 no-eager level=3 rollout 所需的 dynamo 由 `ATOMReplicaManager` 在创建 ATOM Ray actor 时通过
+`runtime_env` 注入 `TORCHDYNAMO_DISABLE=0`,**只作用于 rollout 进程**(判据与 per-replica compile
+cache 隔离共用:`compilation_config.level>0` 或 `enforce_eager=false`)。
+**不要在顶层 `export TORCHDYNAMO_DISABLE=0`** —— 那会让训练 actor 一并继承;dynamo 对训练侧纯属
+副作用,这也是它一度被全局打开的原因。
 
 ### 8.1 已验证 helper scripts（可选，本机 run area）
 
 如果使用本 run area（`lumenrl_native_vllm_fsdp_run/`）而不是直接在 `$RL_ROOT/Lumen-RL` 内手敲
 `docker exec`，可用 `scripts/` 下的两个 wrapper；它们只是把本节 `run_dapo.sh` 的 ATOM FP8
-no-eager level=3 方案固化成可重复命令：
+no-eager level=3 方案固化成可重复命令。
+
+> 这个 run area **不随仓库分发**，新机器上通常不存在（`ls $RL_ROOT/../lumenrl_native_vllm_fsdp_run`
+> 确认）。没有它就直接用 §9 / §10 的 `docker exec` + `run_dapo.sh` 命令，功能完全等价。
 
 ```bash
 # 4k smoke：默认 3 step、batch=64、gen_batch=24、num_generations=8、no eval/no save。
 # 打开 no-eager level=3 时需同时打开 sleep2。
+# 注意：不要再传 TORCHDYNAMO_DISABLE=0 —— dynamo 现在由 ATOM Ray actor 的 runtime_env
+# 按进程注入（见 §8），顶层传 0 会让训练 actor 一并继承。
 SMOKE_STEPS=1 \
-TORCHDYNAMO_DISABLE=0 \
 ATOM_ENFORCE_EAGER=false \
 ATOM_COMPILATION_LEVEL=3 \
 ENABLE_SLEEP_MODE=true \
@@ -713,7 +616,9 @@ rm -rf "$AITER_DIR/aiter/jit/build/lock_module_rmsnorm" \
 
 ```bash
 S=$RL_ROOT/Lumen-RL/examples/DAPO/run_dapo.sh
-ENVX="export RL_ROOT='$RL_ROOT' DATA_ROOT='$DATA_ROOT';"   # 显式注入，避免容器内 RL_ROOT 为空
+# 显式注入，避免容器内 RL_ROOT 为空；同时把 PYTORCH_CUDA_ALLOC_CONF 置空（§8：本平台不支持
+# expandable_segments）。注意 `export VAR=;` 是"设为空值"，脚本会据此 unset 掉它。
+ENVX="export RL_ROOT='$RL_ROOT' DATA_ROOT='$DATA_ROOT' PYTORCH_CUDA_ALLOC_CONF=;"
 
 # BF16 vLLM：512-token 小配置。
 sudo docker exec "$CONTAINER" bash -lc "$ENVX \
@@ -735,9 +640,19 @@ sudo docker exec "$CONTAINER" bash -lc "$ENVX \
   tail -80 \"\$(cat /tmp/run_dapo_log.txt)\""
 
 # 确认 ATOM 正在跑 no-eager level=3（run_dapo.sh 的 MODE=atomfp8 覆盖项）。
+# 期望有一行 "rollout-scoped TORCHDYNAMO_DISABLE=0 (driver keeps 1)"：driver 是 1 才是对的。
 sudo docker exec "$CONTAINER" bash -lc '
 L=$(cat /tmp/run_dapo_log.txt)
-grep -aE "enforce_eager=false|compilation_config|level=3|TORCHDYNAMO_DISABLE=0|Ray ATOM rollout ready" "$L" | tail -20
+grep -aE "enforce_eager=false|compilation_config|level=3|rollout-scoped TORCHDYNAMO|torch compile cache_dir|Ray ATOM rollout ready" "$L" | tail -20
+'
+
+# 更硬的证据：直接读进程 env —— 训练 actor 必须是 1，rollout actor 必须是 0（跑起来时执行）。
+sudo docker exec "$CONTAINER" bash -lc '
+for pat in LumenActorWorker ATOMRayServer; do
+  p=$(pgrep -f $pat | head -1)
+  echo "--- $pat pid=$p"
+  [ -n "$p" ] && tr "\0" "\n" < /proc/$p/environ | grep -E "^(TORCHDYNAMO_DISABLE|PYTORCH_CUDA_ALLOC_CONF|LUMEN_FP8)="
+done
 '
 ```
 
@@ -753,11 +668,18 @@ Smoke 期望证据:
 - `RLTrainer.setup (ray-controller) complete: ... actor_workers=8`、`VLLMRayServer[i]: engine seed=<10086+i>`
   - ATOM:`ATOMRayServer[...] AsyncLLMEngine ready`、`Ray ATOM rollout ready: ... online_quant={'global_quant_config': 'per_block_fp8'}`
   - ATOM no-eager level=3:日志中应能看到 `enforce_eager=false` / `compilation_config.level=3`
-    或等价的 ATOM engine kwargs；`TORCHDYNAMO_DISABLE=0`。
+    或等价的 ATOM engine kwargs;以及每 replica 一行 `torch compile cache_dir=...`。
+  - dynamo 作用域:`ATOMReplicaManager: rollout-scoped TORCHDYNAMO_DISABLE=0 (driver keeps 1)`。
+    **driver 显示 1 才正确** —— 只有 rollout actor 该拿到 0。要更硬的证据就读进程 env(上面第二条命令):
+    `LumenActorWorker` = `TORCHDYNAMO_DISABLE=1`,`ATOMRayServer` = `0`。
 - 小配置可能关闭 `filter_groups`；若开启，`kept` 应 >0。若 `kept 0/...` + `Rollout reward: accuracy=0.0000` + 大量 `finished with reason max`,是 rollout 退化,见 §12。
 - `callbacks: step=1 ... entropy=... grad_norm~0.85 ppo_kl=0`,exit 0
   - BF16:`rollout_corr/kl≈0.001`;vLLM-FP8:`≈0.003–0.004`;ATOM-FP8:`≈0.004`
-- FP8 训练额外:`[verl] Restored lm_head to BF16` / `Lumen optimizations applied`、`online fp8 reload: ...weights=399`
+- FP8 训练额外:`[verl] Restored lm_head to BF16`、`online fp8 reload: ...weights=399`
+  - `Lumen optimizations applied (fp8=True, ...)` 这行来自 `fsdp_backend` 的 worker logger,**默认不一定
+    出现在 driver 日志里**(历史上能看到是因为挂了 `probe_apply_lumen.py`)。别把"没看到"当成 FP8 没生效。
+  - 可靠判据是训练 actor 走了哪套 GEMM:`grep -a LumenActorWorker "$L" | grep -c a8w8_blockscale_tuned_gemm`
+    应 >0(FP8 blockwise);`TRAIN_FP8=0` 时该值为 0、只出现 `bf16_tuned_gemm.csv`。
 - **不应**出现 `materialized on CPU`、`has no attribute`、entropy≈0.04 / grad_norm 1e4+(见第 12 节排障)
 
 ---
@@ -767,14 +689,27 @@ Smoke 期望证据:
 ```bash
 # 三选一：
 S=$RL_ROOT/Lumen-RL/examples/DAPO/run_dapo.sh
-# 显式把 RL_ROOT/DATA_ROOT 注入容器命令（从宿主 §2 变量展开），detached exec 不再依赖 §4 的 -e 注入。
-ENVX="export RL_ROOT='$RL_ROOT' DATA_ROOT='$DATA_ROOT';"
+# 显式把 RL_ROOT/DATA_ROOT 注入容器命令（从宿主 §2 变量展开），detached exec 不再依赖 §4 的 -e 注入；
+# 同时把 PYTORCH_CUDA_ALLOC_CONF 置空（§8）。
+ENVX="export RL_ROOT='$RL_ROOT' DATA_ROOT='$DATA_ROOT' PYTORCH_CUDA_ALLOC_CONF=;"
 sudo docker exec -d "$CONTAINER" bash -lc "$ENVX STEPS=1000 MODE=bf16                bash '$S'"   # BF16
 sudo docker exec -d "$CONTAINER" bash -lc "$ENVX STEPS=1000 MODE=fp8                bash '$S'"   # vLLM FP8 rollout + BF16 训练
 sudo docker exec -d "$CONTAINER" bash -lc "$ENVX STEPS=1000 MODE=fp8     TRAIN_FP8=1 bash '$S'"   # vLLM FP8 rollout + FP8 训练
 sudo docker exec -d "$CONTAINER" bash -lc "$ENVX STEPS=1000 MODE=atomfp8 TRAIN_FP8=1 bash '$S'"   # ATOM FP8 rollout + FP8 训练（no-eager level=3 + sleep2）
 # W&B(可选):把 key 放 $RL_ROOT/wandb.key,格式 WANDB_API_KEY=xxxx(脚本自动读)
+
+# 更密的落盘 / 换 ckpt 位置：用 EXTRA_OVERRIDE 追加 Hydra 覆盖（空格分隔）。
+sudo docker exec -d "$CONTAINER" bash -lc "$ENVX STEPS=1000 MODE=atomfp8 TRAIN_FP8=1 \
+  EXTRA_OVERRIDE='checkpointing.save_steps=10 checkpointing.save_total_limit=2' bash '$S'"
 ```
+
+> ⚠️ **`DATA_ROOT` 想换盘时必须无条件覆盖**。§4 的 `docker run -e DATA_ROOT=...` 把值烤进了容器环境,
+> 所以自建 wrapper 里写 `export DATA_ROOT="${DATA_ROOT:-/new/disk}"` **不会生效**(变量已存在),
+> ckpt 会静默写回旧盘。上面的 `ENVX` 是无条件赋值,安全;自己写 wrapper 请直接
+> `export DATA_ROOT=/new/disk`。
+>
+> 代码留在 `$HOME`、数据/ckpt/日志放大容量盘时,`DATA_ROOT` 指到那块盘即可(§2),模型与
+> `data_cached/` 需一并搬过去。`save_steps=10` + 8B FSDP2 约 90GB/ckpt,务必先 `df -h` 看余量。
 
 本机 run area 可直接：
 
@@ -848,8 +783,24 @@ sudo docker exec "$CONTAINER" bash -lc '
 - `policy.generation.vllm_cfg.enable_sleep_mode=true` 且 `sleep_level=2`（rollout 后释放 KV cache /
   weights / CUDA graph;否则 no-eager CUDA graph 与 rollout 权重常驻,训练 backward 容易
   `HSA_STATUS_ERROR_OUT_OF_RESOURCES`）。
+- dynamo **不要手工开**:`ATOMReplicaManager` 会在建 ATOM Ray actor 时通过 `runtime_env` 注入
+  `TORCHDYNAMO_DISABLE=0`,只作用于 rollout 进程;脚本全局保持 `=1`。顶层 `export TORCHDYNAMO_DISABLE=0`
+  会让训练 actor 一并继承(纯副作用),见 §8。
 - 若失败后显存仍高,清理 `spawn_main` / `torch/_inductor/compile_worker` 孤儿进程,或直接
   `docker restart "$CONTAINER"`；容器 stop/start 不丢依赖。
+
+**跑完/中断后显存不释放**（`rocm-smi` 每卡仍 ~90GB，但 `ps` 里已无 trainer）:`run_dapo.sh` 只在
+**启动前**清理进程,收尾不清,所以 ATOM EngineCore 的 `spawn_main` 子进程（及其 inductor
+compile worker）会变成孤儿继续占显存。下次 `run_dapo.sh` 启动时会被清掉,但期间这台机器等于没卡。
+手动清（注意用 `spawn[_]main` 这类写法，否则 `pkill -f` 会匹配到自己的命令行而自杀）:
+
+```bash
+sudo docker exec "$CONTAINER" bash -lc '
+  pkill -9 -f "compile_[w]orker" || true
+  pkill -9 -f "spawn[_]main"     || true
+  pkill -9 -f "resource[_]tracker" || true
+  sleep 8; rocm-smi --showmeminfo vram | grep -i used | head -3'   # 应回到 ~298MB/卡
+```
 
 **ATOM rollout 退化**(`MODE=atomfp8` 时 `filter_groups: kept 0/96` + `Rollout reward: accuracy=0.0000`
 + 日志大量 `finished with reason max`、无 `eos`):rollout 生成崩坏(全部答错、打满 max length)。优先检查
@@ -885,21 +836,29 @@ RMSNorm 未传 `use_model_sensitive_rmsnorm=1`,与训练侧 T5-like RMSNorm 不�
     `policy.generation.atom_cfg.engine_kwargs.compilation_config.level=3`；同时开启
     `ATOM_ISOLATE_TORCH_COMPILE_CACHE=1`（每 replica 独立 compile cache）与
     `policy.generation.vllm_cfg.enable_sleep_mode=true`、`sleep_level=2`（训练前释放 rollout 显存）。
+  - `lumenrl/engine/inference/atom_ray_server.py` 的 `ATOMReplicaManager.create()`：给 rollout actor 的
+    `runtime_env.env_vars` 注入 `TORCHDYNAMO_DISABLE=0`，判据 `_torch_compile_enabled()`
+    （`compilation_config.level>0` 或 `enforce_eager=false`，与 compile-cache 隔离同一判据）。
+    这样 no-eager level=3 需要的 dynamo 只落在 rollout 进程，FSDP2 训练 actor 保持
+    `TORCHDYNAMO_DISABLE=1`；**不需要（也不应）在启动脚本里全局 export**。
   - aiter shim `examples/DAPO/atom_aiter_shim/sitecustomize.py`:补齐 ATOM 所需的 aiter FP8/MLA 子模块
     (`run_dapo.sh` 自动挂到 PYTHONPATH,`LUMENRL_ATOM_AITER_SRC` 默认取 `$AITER_DIR`)。
 
 ---
 
-## 14. verl 运行（复用同一环境：BF16 基线 + Lumen FP8 E2E）
+## 14. verl 运行（复用同一环境：BF16 基线 + FP8 rollout）
 
 > 本节让**同一台机器、同一个容器**在原生 LumenRL 之外，再跑通 **verl `recipe/dapo`**（DAPO 动态采样）的
 > 两条路线，**完全复用前面第 3–6 节**的容器 (`$CONTAINER`)、模型 (`Qwen3-8B-Base`) 与过滤后的数据
 > (`data_cached/qwen3-8b-maxprompt1024/*.filtered.parquet`)，**无需重建容器、无需重下模型/数据**：
 >
 > - **BF16 基线**：`recipe.dapo.main_dapo` + BF16 FSDP 训练 + vLLM BF16 async rollout（AITER off，`quantization=null`）。
-> - **Lumen FP8 E2E**：`lumen.rl.verl.verl_entry`（`LUMEN_VERL_MAIN=dapo` 委托 dapo，保留 filter_groups）
->   + FSDP2 actor Lumen FP8（blockwise2d linear + mha attn + model-sensitive RMSNorm）
+> - **FP8 rollout + ATOM 对齐训练**：`lumen.rl.verl.verl_entry`（`LUMEN_VERL_MAIN=dapo` 委托 dapo，保留 filter_groups）
+>   + FSDP2 actor 的 ATOM 对齐前向（norm/sdpa/BF16 TunedGemm linear/mlp）
 >   + vLLM async rollout `fp8_per_block` + AITER unified attention。
+>   **⚠️ 训练侧是 BF16 不是 FP8**：`LUMEN_ROLLOUT=ATOM` 让 `LumenConfig.enable()` 在
+>   `lumen/config.py:253-260` 提前 `return None, model`，FP8 量化（第 262 行之后）走不到。
+>   要训练侧真 FP8 就删掉 `LUMEN_ROLLOUT=ATOM`，并用 §14.5 的指纹判据核实。
 >
 > 关键点：verl 与 Lumen/aiter 一样放在 `$RL_ROOT` 下（`$RL_ROOT/verl`），第 4 节 `-v "$RL_ROOT":"$RL_ROOT"`
 > 已把它挂进容器，因此**不用改容器**。`Lumen`(`amd-atom-rollout`)、`aiter`(`lumen/triton_kernels`) 已在第 3 节
@@ -1032,9 +991,10 @@ EOF
 chmod +x "$RL_ROOT/run_smoke_dapo.sh"
 ```
 
-### 14.4 Lumen FP8 E2E smoke 脚本 `$RL_ROOT/run_smoke_dapo_fp8.sh`
+### 14.4 FP8 rollout smoke 脚本 `$RL_ROOT/run_smoke_dapo_fp8.sh`（训练侧 BF16，见脚本内注释）
 
-相对 14.3：入口换成 `lumen.rl.verl.verl_entry`（委托 dapo），actor `fsdp2` + Lumen FP8 env，rollout
+相对 14.3：入口换成 `lumen.rl.verl.verl_entry`（委托 dapo），actor `fsdp2` + Lumen ATOM 对齐前向
+（**训练侧仍是 BF16**，`LUMEN_FP8=1` 被 `LUMEN_ROLLOUT=ATOM` 的提前 return 跳过），rollout
 `fp8_per_block` + AITER unified attention。依赖第 3 节的 `Lumen`/`aiter` 与第 5 节 vLLM patch。
 
 ```bash
@@ -1054,7 +1014,15 @@ export RAY_DEDUP_LOGS=0 PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=false HYDRA_FU
 export TORCHDYNAMO_DISABLE=1 RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0 VLLM_USE_V1=1
 export HIP_FORCE_DEV_KERNARG=1 HSA_NO_SCRATCH_RECLAIM=1 CUDA_DEVICE_MAX_CONNECTIONS=1 VLLM_LOGGING_LEVEL=WARN
 export VERL_EMPTY_CACHE_PER_MICRO_BATCH=1
-# Lumen actor FP8 + ATOM 对齐 patch + 委托 dapo
+# Lumen actor ATOM 对齐 patch + 委托 dapo。
+#
+# ⚠️ 训练侧是 BF16，不是 FP8。LUMEN_ROLLOUT=ATOM 让 LumenConfig.enable()
+#    (lumen/config.py:253-260) 走 ATOM 分支并 `return None, model`，而 FP8 量化在
+#    第 262 行之后的「3. FP8 linear quantization」，永远走不到。所以这里的
+#    LUMEN_FP8=1 / LUMEN_FP8_SCALING=blockwise2d 对 actor 无效，只有
+#    norm/sdpa/linear/mlp 四个 ATOM 对齐 patch 生效（linear 是 BF16 TunedGemm）。
+#    本脚本的准确描述是「FP8 rollout（vLLM fp8_per_block）+ BF16 ATOM 对齐训练」。
+#    要训练侧真 FP8：删掉 LUMEN_ROLLOUT=ATOM（其余不动），并用 §14.5 的指纹判据核实。
 export LUMEN_VERL_MAIN=dapo LUMEN_FP8=1 LUMEN_ROLLOUT=ATOM LUMEN_FP8_FORMAT=fp8_e4m3 LUMEN_FP8_SCALING=blockwise2d LUMEN_FP8_BLOCK_SIZE=128
 export LUMEN_FP8_ATTN=mha LUMEN_FP8_QUANT_TYPE=blockwise LUMEN_ATTN_BACKEND=auto LUMEN_FORCE_FSDP=1
 export LUMEN_ACTOR_PATCH_NORM=1 LUMEN_ACTOR_PATCH_SDPA=1 LUMEN_ACTOR_PATCH_LINEAR=1 LUMEN_ACTOR_PATCH_MLP=1
@@ -1116,7 +1084,7 @@ sudo docker restart "$CONTAINER"; sleep 6            # 清残留 ray 进程
 sudo docker exec -e RL_ROOT="$RL_ROOT" -e DATA_ROOT="$DATA_ROOT" "$CONTAINER" \
   bash -lc "bash $RL_ROOT/run_smoke_dapo.sh" 2>&1 | tee $DATA_ROOT/logs/verl_smoke_bf16_$(date +%Y%m%d-%H%M%S).log
 
-# FP8 E2E smoke
+# FP8 rollout smoke（训练侧 BF16；要真 FP8 见 §14.4 注释）
 sudo docker restart "$CONTAINER"; sleep 6
 sudo docker exec -e RL_ROOT="$RL_ROOT" -e DATA_ROOT="$DATA_ROOT" "$CONTAINER" \
   bash -lc "bash $RL_ROOT/run_smoke_dapo_fp8.sh" 2>&1 | tee $DATA_ROOT/logs/verl_smoke_fp8_$(date +%Y%m%d-%H%M%S).log
@@ -1124,14 +1092,44 @@ sudo docker exec -e RL_ROOT="$RL_ROOT" -e DATA_ROOT="$DATA_ROOT" "$CONTAINER" \
 
 期望证据（已验证：8×MI350X, Qwen3-8B-Base, 各 1 步, exit 0, 无 Traceback）：
 
-| 证据 | BF16 | Lumen FP8 E2E |
-|---|---|---|
-| `step:1 ... actor/loss ... actor/grad_norm` | loss≈-0.093, grad_norm≈1.09 | loss≈0.028, grad_norm≈0.89 |
-| `rollout_corr/rollout_is_mean` | ≈1.0（0.9999） | ≈1.0（1.0000） |
-| `rollout_corr/kl` | ≈0.001 | **≈0.005**（FP8 gap，正常；逼近 2.0 才警惕） |
-| `train/num_gen_batches` | ≥1（filter_groups 动态采样生效） | ≥1（同） |
-| FP8 特有 | — | 8 worker `[verl] Lumen optimizations applied (actor/full) before FSDP2 wrapping`；vLLM `quantization=fp8_per_block`；`kernel_unified_attention_3d` JIT（AITER unified attention 生效） |
-| 收尾 | `Final validation metrics: None`（未测评） | 同左；首次会 JIT 编译 aiter `module_rmsnorm` / per-block GEMM（较慢，二次快） |
+> 下表第三列是 §14.4 脚本的原样行为，即 **FP8 rollout + BF16 ATOM 对齐训练**（`LUMEN_ROLLOUT=ATOM`
+> 使 actor FP8 量化被跳过，见 §14.4 脚本内注释）。第四列是删掉 `LUMEN_ROLLOUT=ATOM` 后的
+> **训练侧真 FP8**，2026-07-29 在 8×MI355X 实测。
+
+| 证据 | BF16 | ATOM 对齐（actor BF16） | 训练侧真 FP8 |
+|---|---|---|---|
+| `step:1 ... actor/loss ... actor/grad_norm` | loss≈-0.093, grad_norm≈1.09 | loss≈0.028, grad_norm≈0.89 | loss≈0.084, grad_norm≈1.04 |
+| `rollout_corr/rollout_is_mean` | ≈1.0（0.9999） | ≈1.0（1.0000） | ≈1.0（0.9994） |
+| `rollout_corr/kl` | ≈0.001 | **≈0.005**（rollout FP8 gap；逼近 2.0 才警惕） | ≈0.004（长跑稳态降到 0.0010–0.0012） |
+| `train/num_gen_batches` | ≥1（filter_groups 动态采样生效） | ≥1（同） | ≥1（同） |
+| Lumen 注入生效 | — | 8 worker `[verl] Lumen optimizations applied (actor/full) before FSDP2 wrapping` | 同左 |
+| 训练侧 FP8 判据 | 无 | **无**（见下方指纹检查） | `Restored lm_head` ×8 + 指纹检查为真 |
+| rollout FP8 | — | vLLM `quantization=fp8_per_block`；`kernel_unified_attention_3d` JIT | 同左 |
+| 收尾 | `Final validation metrics: None`（未测评） | 同左；首次会 JIT 编译 aiter `module_rmsnorm` / per-block GEMM（较慢，二次快） | 同左 |
+
+> ⚠️ `[verl] Lumen optimizations applied (actor/full)` **不能**用来判断训练侧是否 FP8。它由 verl
+> worker patch 打印，与 FP8 是否启用无关，两种情况都出现 8 次。历史版本把它列为「FP8 特有」是错的。
+
+**判断训练侧到底跑没跑 FP8（唯一可靠的方法）**——看训练 actor 加载了哪些 aiter 模块。
+注意 verl 的训练进程名是 `WorkerDict`（LumenRL 侧是 `LumenActorWorker`，见 §9）：
+
+```bash
+LOG=<你的 verl 日志>
+grep -a "WorkerDict" "$LOG" | grep -aoE "module_[a-z0-9_]+" | sort | uniq -c
+```
+
+- 出现 `module_gemm_a8w8_blockscale` / `module_quant` → 训练侧是**真 FP8**
+- 只有 `module_rmsnorm` + `module_activation` → **ATOM 分支，训练侧 BF16**
+
+更强的一条是运行时调用（不只是启动期导入），并且能证明 FP8 在训练侧而非 rollout 侧：
+
+```bash
+grep -a "a8w8_blockscale_tuned_gemm" "$LOG" | grep -c WorkerDict        # 训练侧 FP8 GEMM 调用数
+grep -a "a8w8_blockscale_tuned_gemm" "$LOG" | grep -c vLLMHttpServer    # 应为 0
+```
+
+2026-07-29 实测真 FP8 长跑：前者 9426、后者 0；GEMM shape 为 `N:4096,K:12288`(down_proj)、
+`N:12288,K:4096`(gate/up)、`N:1024,K:4096`(k/v)，M 随动态批变化——即 Qwen3-8B 的真实训练层。
 
 ### 14.6 长跑规模（相对 smoke 只放大规模/落盘）
 
@@ -1169,11 +1167,16 @@ grep -aE "step:[0-9]+ -" "$LOG" | tail -1      # 最新 step 指标
 
 ### 14.7 verl vs LumenRL / BF16 vs FP8 一览
 
-| 维度 | verl BF16 | verl Lumen FP8 E2E | LumenRL 原生（§1） |
+> ⚠️ 第三列（§14.4 脚本原样）历史上被标为「FP8 E2E」，但**训练侧其实是 BF16**：
+> `LUMEN_ROLLOUT=ATOM` 让 `LumenConfig.enable()` 在 `lumen/config.py:253-260` 提前
+> `return None, model`，FP8 量化（第 262 行之后）走不到。要真 FP8 训练见 §14.4 注释与
+> §14.5 指纹判据。
+
+| 维度 | verl BF16 | verl ATOM 对齐（actor BF16） | LumenRL 原生（§1） |
 |---|---|---|---|
 | 入口 | `recipe.dapo.main_dapo` | `lumen.rl.verl.verl_entry`（→ dapo） | `lumenrl.trainer.main` |
 | actor 策略 | FSDP | FSDP2 + Lumen ATOM(norm/sdpa/linear/mlp) | Lumen FSDP2 |
-| actor 量化 | 无（BF16） | ATOM 对齐 + blockwise2d linear + mha attn + model-sensitive RMSNorm | 可选 FP8 blockwise2d |
+| actor 量化 | 无（BF16） | **无（BF16）**——ATOM 对齐前向：norm/sdpa/**BF16 TunedGemm** linear/mlp；`LUMEN_FP8=1` 被提前 return 跳过 | 可选 FP8 blockwise2d |
 | rollout | vLLM async BF16，`quantization=null`，AITER off | vLLM async，`quantization=fp8_per_block`，AITER unified attention | vLLM/ATOM AsyncLLM |
 | 动态采样 | filter_groups (acc) | filter_groups (acc)（保留） | `algorithm.dapo.filter_groups` |
 | 需手动 patch | 无 | 复用第 5 节 vLLM AITER RMSNorm patch | 第 5 节同 patch |
