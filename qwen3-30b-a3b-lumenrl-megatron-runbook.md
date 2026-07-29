@@ -69,16 +69,16 @@ read -r -p "模型根目录 MODEL_HOST_DIR（其下放 Qwen3-30B-A3B）: " MODEL
 read -r -p "数据根目录 DATASET_HOST_DIR: " DATASET_HOST_DIR
 read -r -p "日志/checkpoint 目录 RUNTIME_HOST_DIR: " RUNTIME_HOST_DIR
 read -r -p "共享目录 SHARED_HOST_DIR（没有则填本地空目录）: " SHARED_HOST_DIR
-read -r -p "离线 wheel 目录 WHEEL_HOST_DIR: " WHEEL_HOST_DIR
 read -r -p "rollout 镜像 [rocm/atom-dev:vllm-latest]: " ROLLOUT_IMAGE
 read -r -p "trainer 镜像 [rocm/atom-dev:latest]: " TRAIN_IMAGE
 read -r -p "W&B project [LumenRL]: " WANDB_PROJECT
 read -r -p "W&B entity（留空使用当前账号默认）: " WANDB_ENTITY
 
 export WORK_ROOT MODEL_HOST_DIR DATASET_HOST_DIR RUNTIME_HOST_DIR
-export SHARED_HOST_DIR WHEEL_HOST_DIR
+export SHARED_HOST_DIR
 export LUMENRL_HOST_DIR="${WORK_ROOT}/Lumen-RL"
 export LUMEN_HOST_DIR="${WORK_ROOT}/Lumen"
+export MEGATRON_HOST_DIR="${WORK_ROOT}/Megatron-LM"
 export CONTAINER="${CONTAINER:-qwen3-30b-rl}"
 export ROLLOUT_IMAGE="${ROLLOUT_IMAGE:-rocm/atom-dev:vllm-latest}"
 export TRAIN_IMAGE="${TRAIN_IMAGE:-rocm/atom-dev:latest}"
@@ -86,7 +86,7 @@ export WANDB_PROJECT="${WANDB_PROJECT:-LumenRL}"
 export WANDB_ENTITY
 
 for p in "$WORK_ROOT" "$MODEL_HOST_DIR" "$DATASET_HOST_DIR" \
-         "$RUNTIME_HOST_DIR" "$SHARED_HOST_DIR" "$WHEEL_HOST_DIR"; do
+         "$RUNTIME_HOST_DIR" "$SHARED_HOST_DIR"; do
   test -n "$p" || { echo "路径不能为空"; exit 1; }
   mkdir -p "$p"
 done
@@ -104,9 +104,9 @@ export MODEL_HOST_DIR='$MODEL_HOST_DIR'
 export DATASET_HOST_DIR='$DATASET_HOST_DIR'
 export RUNTIME_HOST_DIR='$RUNTIME_HOST_DIR'
 export SHARED_HOST_DIR='$SHARED_HOST_DIR'
-export WHEEL_HOST_DIR='$WHEEL_HOST_DIR'
 export LUMENRL_HOST_DIR='$LUMENRL_HOST_DIR'
 export LUMEN_HOST_DIR='$LUMEN_HOST_DIR'
+export MEGATRON_HOST_DIR='$MEGATRON_HOST_DIR'
 export CONTAINER='$CONTAINER'
 export ROLLOUT_IMAGE='$ROLLOUT_IMAGE'
 export TRAIN_IMAGE='$TRAIN_IMAGE'
@@ -123,11 +123,13 @@ echo "saved $ENV_FILE"
 ```text
 /workspace/Lumen-RL       LumenRL 源码
 /workspace/Lumen          Lumen 依赖源码
+/workspace/Megatron-LM    ROCm Megatron-LM 源码（含 megatron.training 和 RouterReplay）
+/workspace/aiter          aiter 源码（GPU kernel 编译）
+/workspace/flash-attention  ROCm flash-attention 源码
 /root/models              模型
 /root/data_cached         已过滤数据
 /runtime                  日志与 checkpoint
 /shared                   可选 shared_folder fallback
-/tmp/wheels               离线 wheel
 /dev/infiniband           RoCE verbs 设备
 ```
 
@@ -311,41 +313,94 @@ ping -I "$RDMA_IFACE" -c 3 "$ROLLOUT_RDMA_IP"
 | rollout / Ray head | `${ROLLOUT_NODE_IP}` | `${ROLLOUT_RDMA_IP}` | 8 | `${ROLLOUT_IMAGE}` |
 | Megatron trainer | `${TRAIN_NODE_IP}` | `${TRAIN_RDMA_IP}` | 8 | `${TRAIN_IMAGE}` |
 
-## 4. 拉取 LumenRL 代码
+## 4. 拉取源码
 
-唯一要求的 LumenRL 分支是：
+所有组件从 source 安装。各仓库和分支：
 
-```text
-origin/dev/moe-grpo
-```
+| 组件 | 仓库 | 分支 |
+|---|---|---|
+| LumenRL | `https://github.com/ZhangDanyang-AMD/Lumen-RL.git` | `dev/moe-grpo` |
+| Lumen | `https://github.com/ZhangDanyang-AMD/Lumen.git` | `dev/qwen3-30b-a3b` |
+| Megatron-LM | `https://github.com/ROCm/Megatron-LM.git` | `rocm_dev` |
+| aiter | `https://github.com/ZhangDanyang-AMD/aiter.git` | `lumen/qwen3-30b-a3b` |
+| flash-attention | `https://github.com/ROCm/flash-attention.git` | `main`（或与镜像 ROCm 版本匹配的 tag） |
 
-准备代码：
+两台节点都执行：
 
 ```bash
-source "$HOME/qwen3-rdma-node.env"
+source “$HOME/qwen3-rdma-node.env”
 
-if [ ! -d "$LUMENRL_HOST_DIR/.git" ]; then
-  git clone https://github.com/ZhangDanyang-AMD/Lumen-RL.git "$LUMENRL_HOST_DIR"
+# LumenRL
+if [ ! -d “$LUMENRL_HOST_DIR/.git” ]; then
+  git clone https://github.com/ZhangDanyang-AMD/Lumen-RL.git “$LUMENRL_HOST_DIR”
 fi
-if [ ! -d "$LUMEN_HOST_DIR/.git" ]; then
-  git clone --branch amd-atom-rollout \
-    https://github.com/ZhangDanyang-AMD/Lumen.git "$LUMEN_HOST_DIR"
-fi
-cd "$LUMENRL_HOST_DIR"
+cd “$LUMENRL_HOST_DIR”
 git fetch origin dev/moe-grpo
 git switch dev/moe-grpo 2>/dev/null \
   || git switch -c dev/moe-grpo --track origin/dev/moe-grpo
 git merge --ff-only origin/dev/moe-grpo
 
-test "$(git rev-parse HEAD)" = "$(git rev-parse origin/dev/moe-grpo)"
-git log -1 --oneline
+# Lumen
+if [ ! -d “$LUMEN_HOST_DIR/.git” ]; then
+  git clone https://github.com/ZhangDanyang-AMD/Lumen.git “$LUMEN_HOST_DIR”
+fi
+cd “$LUMEN_HOST_DIR”
+git fetch origin dev/qwen3-30b-a3b
+git switch dev/qwen3-30b-a3b 2>/dev/null \
+  || git switch -c dev/qwen3-30b-a3b --track origin/dev/qwen3-30b-a3b
+git merge --ff-only origin/dev/qwen3-30b-a3b
+
+# Megatron-LM（ROCm fork，含 megatron.training 和 RouterReplay）
+if [ ! -d “$MEGATRON_HOST_DIR/.git” ]; then
+  git clone https://github.com/ROCm/Megatron-LM.git “$MEGATRON_HOST_DIR”
+fi
+cd “$MEGATRON_HOST_DIR”
+git fetch origin rocm_dev
+git switch rocm_dev 2>/dev/null \
+  || git switch -c rocm_dev --track origin/rocm_dev
+git merge --ff-only origin/rocm_dev
+
+# aiter
+AITER_HOST_DIR=”${WORK_ROOT}/aiter”
+if [ ! -d “$AITER_HOST_DIR/.git” ]; then
+  git clone https://github.com/ZhangDanyang-AMD/aiter.git “$AITER_HOST_DIR”
+fi
+cd “$AITER_HOST_DIR”
+git fetch origin lumen/qwen3-30b-a3b
+git switch lumen/qwen3-30b-a3b 2>/dev/null \
+  || git switch -c lumen/qwen3-30b-a3b --track origin/lumen/qwen3-30b-a3b
+git merge --ff-only origin/lumen/qwen3-30b-a3b
+
+# flash-attention
+FA_HOST_DIR=”${WORK_ROOT}/flash-attention”
+if [ ! -d “$FA_HOST_DIR/.git” ]; then
+  git clone https://github.com/ROCm/flash-attention.git “$FA_HOST_DIR”
+fi
+
+# 保存路径（MEGATRON_HOST_DIR 已在 Section 2.1 写入 env file）
+cat >> “$HOME/qwen3-rdma-node.env” <<EOF
+export AITER_HOST_DIR='$AITER_HOST_DIR'
+export FA_HOST_DIR='$FA_HOST_DIR'
+EOF
 ```
+
+验证两台节点代码一致：
+
+```bash
+source “$HOME/qwen3-rdma-node.env”
+echo “LumenRL:    $(cd “$LUMENRL_HOST_DIR” && git rev-parse HEAD)”
+echo “Lumen:      $(cd “$LUMEN_HOST_DIR” && git rev-parse HEAD)”
+echo “Megatron:   $(cd “$MEGATRON_HOST_DIR” && git rev-parse HEAD)”
+echo “aiter:      $(cd “$AITER_HOST_DIR” && git rev-parse HEAD)”
+echo “fa:         $(cd “$FA_HOST_DIR” && git rev-parse HEAD)”
+```
+
+两台节点的五行输出必须分别相同。
 
 注意：
 
-- 不要把本 runbook 写成“主干最新版本”；必须明确 `origin/dev/moe-grpo`。
-- 两台节点必须打印相同的 `git rev-parse HEAD`。
-- 从零部署不要依赖未提交工作区；所需 RDMA/checkpoint 修复必须已经进入该远端分支。
+- 不要把本 runbook 写成”主干最新版本”；必须明确各分支名。
+- 从零部署不要依赖未提交工作区；所需修复必须已经进入对应远端分支。
 - RDMA 实现参考 MILES 架构思想，但没有复制或嵌入 MILES 源码。
 
 ## 5. 已验证容器软件版本
@@ -360,7 +415,7 @@ git log -1 --oneline
 | PyTorch | `2.10.0+rocm7.2.4.git3d3aa833` |
 | HIP (`torch.version.hip`) | `7.2.53211` |
 | Ray | `2.56.1` |
-| Megatron-Core | `0.18.2` |
+| Megatron-LM (ROCm fork) | `rocm_dev` branch（含 megatron.core + megatron.training） |
 | flash-attn | `2.8.4` |
 | amd-aiter | `0.1.0` |
 | Transformers | `5.2.0` |
@@ -393,8 +448,10 @@ git log -1 --oneline
 | triton_kernels | `1.0.0+amd.rocm7.2.0.git89002410` |
 | 基础镜像附带 ATOM | `0.1.6rc1.dev117+g3321d0ff0`（当前 flow 不使用） |
 
-LumenRL/Lumen 通过源码路径和 `PYTHONPATH` 使用，因此 `pip show lumenrl` / `pip show lumen`
-可能显示未安装，这不代表运行环境缺失。
+LumenRL、Lumen、aiter、flash-attention 通过 `pip install -e` 从挂载的源码目录安装。
+Megatron-LM 通过 `.pth` 文件引入（因为其 `pyproject.toml` 的
+`packages.find` 只包含 `megatron.core`，`pip install -e` 不会安装 `megatron.training`）。
+不能用 PyPI 的 `megatron-core`——它既没有 `megatron.training`，也没有 `RouterReplay`。
 
 ## 6. 启动 Docker
 
@@ -424,11 +481,13 @@ docker run -d --name "$CONTAINER" --entrypoint /bin/bash \
   --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
   -v "$LUMENRL_HOST_DIR":/workspace/Lumen-RL \
   -v "$LUMEN_HOST_DIR":/workspace/Lumen \
+  -v "$MEGATRON_HOST_DIR":/workspace/Megatron-LM \
+  -v "$AITER_HOST_DIR":/workspace/aiter \
+  -v "$FA_HOST_DIR":/workspace/flash-attention \
   -v "$DATASET_HOST_DIR":/root/data_cached \
   -v "$MODEL_HOST_DIR":/root/models \
   -v "$SHARED_HOST_DIR":/shared \
   -v "$RUNTIME_HOST_DIR":/runtime \
-  -v "$WHEEL_HOST_DIR":/tmp/wheels \
   "$ROLLOUT_IMAGE" -lc 'sleep infinity'
 ```
 
@@ -445,11 +504,13 @@ docker run -d --name "$CONTAINER" --entrypoint /bin/bash \
   --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
   -v "$LUMENRL_HOST_DIR":/workspace/Lumen-RL \
   -v "$LUMEN_HOST_DIR":/workspace/Lumen \
+  -v "$MEGATRON_HOST_DIR":/workspace/Megatron-LM \
+  -v "$AITER_HOST_DIR":/workspace/aiter \
+  -v "$FA_HOST_DIR":/workspace/flash-attention \
   -v "$DATASET_HOST_DIR":/root/data_cached \
   -v "$MODEL_HOST_DIR":/root/models \
   -v "$SHARED_HOST_DIR":/shared \
   -v "$RUNTIME_HOST_DIR":/runtime \
-  -v "$WHEEL_HOST_DIR":/tmp/wheels \
   "$TRAIN_IMAGE" -lc 'sleep infinity'
 ```
 
@@ -460,66 +521,189 @@ docker run -d --name "$CONTAINER" --entrypoint /bin/bash \
 - trainer 节点不需要安装 vLLM。
 - 两节点容器必须使用 `--network=host`，否则 Ray IP、RoCE IP 与 rendezvous 地址需要重新配置。
 
-## 7. 安装和恢复依赖
+## 7. 从源码安装依赖
 
-当前两节点容器已经包含 §5 的实测版本。重建环境时优先使用用户提供的 wheel cache，避免在线安装漂移。
-`$WHEEL_HOST_DIR` 挂载到 `/tmp/wheels`；rollout 镜像中的 ROCm vLLM 必须保留，
-不要被 PyPI wheel 覆盖。
+所有核心组件从挂载的源码目录构建安装。不使用预编译 wheel。
+不要重装 torch、Triton 或容器镜像自带的 vLLM（rollout 节点）。
 
-trainer 节点按实际 wheel 文件名恢复 Megatron/flash-attn/AITER：
+### 7.1 aiter（两节点都需要，含 HIP C++ 编译）
+
+aiter 包含 HIP/CK GPU kernel，需要编译。首次编译约 15–30 分钟，宿主机挂载的源码目录会
+缓存编译产物，后续重建容器时无需重新编译。
+
+```bash
+source "$HOME/qwen3-rdma-node.env"
+docker exec "$CONTAINER" bash -lc '
+set -e
+cd /workspace/aiter
+/opt/venv/bin/pip install -e . 2>&1 | tail -5
+/opt/venv/bin/python -c "import aiter; print(\"aiter ok:\", aiter.__file__)"
+'
+```
+
+如果编译报错缺少 HIP 头文件或 `hipcc` 不在 PATH，确认容器镜像包含完整 ROCm toolkit：
+
+```bash
+docker exec "$CONTAINER" bash -lc 'hipcc --version && ls /opt/rocm/include/hip/hip_runtime.h'
+```
+
+### 7.2 flash-attention（两节点都需要，含 HIP C++ 编译）
+
+ROCm flash-attention 同样需要编译 HIP kernel。编译约 10–20 分钟。
+
+```bash
+source "$HOME/qwen3-rdma-node.env"
+docker exec "$CONTAINER" bash -lc '
+set -e
+cd /workspace/flash-attention
+GPU_ARCHS="gfx942" /opt/venv/bin/pip install -e . 2>&1 | tail -5
+/opt/venv/bin/python -c "from flash_attn import flash_attn_varlen_func; print(\"flash_attn ok\")"
+'
+```
+
+`GPU_ARCHS="gfx942"` 限制只编译 MI308X 架构，大幅缩短编译时间。如果目标 GPU 是其他
+架构（如 MI350X 的 gfx950），需要相应修改。
+
+### 7.3 Lumen（两节点，含 HIP C++ extension 编译）
+
+Lumen 的 `lumen/csrc/` 包含 HIP C++ extension（`fused_quant_transpose.cu`、
+`fp8_quant_dispatch.cu`），`pip install -e` 会自动调用 `hipcc` 编译。首次编译约 1–2 分钟。
+
+```bash
+source "$HOME/qwen3-rdma-node.env"
+docker exec "$CONTAINER" bash -lc '
+set -e
+/opt/venv/bin/pip install --no-deps -e /workspace/Lumen
+/opt/venv/bin/python -c "import lumen; print(\"lumen ok:\", lumen.__file__)"
+'
+```
+
+### 7.4 LumenRL（两节点，纯 Python editable install）
+
+```bash
+source "$HOME/qwen3-rdma-node.env"
+docker exec "$CONTAINER" bash -lc '
+set -e
+/opt/venv/bin/pip install --no-deps -e /workspace/Lumen-RL
+/opt/venv/bin/python -c "import lumenrl; print(\"lumenrl ok:\", lumenrl.__file__)"
+'
+```
+
+### 7.5 Python 依赖（两节点）
 
 ```bash
 source "$HOME/qwen3-rdma-node.env"
 docker exec "$CONTAINER" bash -lc '
 set -e
 P=/opt/venv/bin/pip
-
-ls /tmp/wheels
-install_if_cached() {
-  pattern=$1
-  set -- /tmp/wheels/$pattern
-  if [ ! -e "$1" ]; then
-    echo "wheel not supplied; keep image package: $pattern"
-    return
-  fi
-  $P install --no-deps "$@"
-}
-install_if_cached "megatron_core-0.18.2-*.whl"
-install_if_cached "flash_attn-2.8.4-*.whl"
-install_if_cached "amd_aiter-0.1.0-*.whl"
-
-$P install --no-deps -e /workspace/Lumen
-$P install --no-deps -e /workspace/Lumen-RL
-
 $P install "ray[default]==2.56.1" \
   "transformers==5.2.0" "datasets==5.0.0" "accelerate==1.14.0" \
   "safetensors==0.8.0" "omegaconf==2.3.1" \
-  "math_verify==0.3.3" "wandb==0.28.1"
-
-/opt/venv/bin/python -c "import megatron.core, flash_attn, aiter; print(\"trainer imports ok\")"
+  "math_verify==0.3.3" "wandb==0.28.1" \
+  "numpy>=1.26" "pybind11>=3.0"
 '
 ```
 
-rollout 节点只补齐公共依赖并安装 LumenRL；不要重装 torch、Triton 或 vLLM：
+### 7.6 Megatron-LM（两节点，通过 .pth 引入）
+
+**不能用 PyPI 的 `megatron-core`**，也不能用 `pip install -e`。原因：
+
+- PyPI 包只含 `megatron.core.*`，不含 `megatron.training`。
+- ROCm fork 的 `pyproject.toml` 同样只把 `megatron.core` 列为可安装包，
+  `pip install -e .` 不会安装 `megatron.training`。
+- Lumen 在 `lumen/models/megatron.py` 顶层 `from megatron.training import get_args`。
+- ROCm fork 包含 `RouterReplay`（`megatron/core/transformer/moe/router_replay.py`）和
+  `moe_enable_routing_replay` config field，是 R3 MoE replay 的核心依赖。
+
+正确做法：在 venv 的 site-packages 中放一个 `.pth` 文件指向 `/workspace/Megatron-LM`。
+这样所有使用该 venv 的进程（包括 Ray worker）都能导入 `megatron.core` 和 `megatron.training`，
+不需要每个进程单独设置 `PYTHONPATH`。
+
+先卸载容器镜像中可能自带的旧版 `megatron-core`（PyPI），再写入 `.pth`：
 
 ```bash
 source "$HOME/qwen3-rdma-node.env"
 docker exec "$CONTAINER" bash -lc '
 set -e
-P=/opt/venv/bin/pip
-$P install --no-deps -e /workspace/Lumen
-$P install --no-deps -e /workspace/Lumen-RL
-$P install "ray[default]==2.56.1" \
-  "transformers==5.2.0" "datasets==5.0.0" "accelerate==1.14.0" \
-  "safetensors==0.8.0" "omegaconf==2.3.1" \
-  "math_verify==0.3.3" "wandb==0.28.1"
+/opt/venv/bin/pip uninstall -y megatron-core 2>/dev/null || true
+SITE=$(/opt/venv/bin/python -c "import site; print(site.getsitepackages()[0])")
+echo "/workspace/Megatron-LM" > "$SITE/megatron-lm-source.pth"
+echo "wrote $SITE/megatron-lm-source.pth"
 '
 ```
 
-### 7.1 flash-attn ROCm ABI
+验证 `.pth` 生效——无需设置 `PYTHONPATH` 即可导入：
 
-当前 cached wheel 的 Python wrapper 曾比 native extension 多传末尾 `num_splits`。`run_grpo.sh`
-启动时会幂等删除这个不支持的参数。
+```bash
+source "$HOME/qwen3-rdma-node.env"
+docker exec "$CONTAINER" bash -lc '
+set -e
+/opt/venv/bin/python -c "
+import megatron.core; print(\"megatron.core ok:\", megatron.core.__file__)
+from megatron.training import get_args; print(\"megatron.training ok\")
+from megatron.core.transformer.moe.router_replay import RouterReplay; print(\"RouterReplay ok\")
+"
+'
+```
+
+### 7.7 验证完整导入链
+
+两节点都执行：
+
+```bash
+source "$HOME/qwen3-rdma-node.env"
+docker exec -i -e HIP_VISIBLE_DEVICES=0 \
+  "$CONTAINER" /opt/venv/bin/python - <<'PY'
+import sys
+checks = []
+
+import aiter; checks.append(("aiter", aiter.__file__))
+import flash_attn; checks.append(("flash_attn", flash_attn.__file__))
+import lumen; checks.append(("lumen", lumen.__file__))
+import lumenrl; checks.append(("lumenrl", lumenrl.__file__))
+import megatron.core; checks.append(("megatron.core", megatron.core.__file__))
+
+try:
+    from megatron.training import get_args
+    checks.append(("megatron.training", "ok"))
+except ImportError:
+    checks.append(("megatron.training", "MISSING — need ROCm Megatron-LM, not PyPI megatron-core"))
+
+try:
+    from megatron.core.transformer.moe.router_replay import RouterReplay
+    checks.append(("RouterReplay", "ok"))
+except ImportError:
+    checks.append(("RouterReplay", "MISSING — need ROCm fork with router_replay"))
+
+try:
+    import vllm; checks.append(("vllm", vllm.__file__))
+except ImportError:
+    checks.append(("vllm", "NOT INSTALLED (ok for trainer node)"))
+
+for name, path in checks:
+    print(f"  {name:12s} {path}")
+
+# 确认 editable install 指向挂载目录
+for name, expected_prefix in [
+    ("lumen", "/workspace/Lumen/"),
+    ("lumenrl", "/workspace/Lumen-RL/"),
+    ("megatron", "/workspace/Megatron-LM/"),
+    ("aiter", "/workspace/aiter/"),
+    ("flash_attn", "/workspace/flash-attention/"),
+]:
+    mod = sys.modules.get(name)
+    if mod and hasattr(mod, "__file__") and mod.__file__:
+        assert mod.__file__.startswith(expected_prefix), \
+            f"{name} imported from {mod.__file__}, expected {expected_prefix}"
+print("all source installs verified")
+PY
+```
+
+### 7.8 flash-attn ROCm ABI 验证
+
+从源码编译的 flash-attn 通常不会有 ABI 不匹配问题。但如果容器镜像自带的
+flash-attn 被保留而非从源码重建，Python wrapper 可能比 native extension 多传
+末尾 `num_splits`。`run_grpo.sh` 启动时会幂等删除这个不支持的参数。
 
 验证 kernel：
 
@@ -860,6 +1044,7 @@ docker exec \
 export PATH=/opt/venv/bin:$PATH
 export RL_ROOT=/workspace
 export DATA_ROOT=/runtime
+export AITER_DIR=/workspace/aiter
 export MODEL_PATH=/root/models/Qwen3-30B-A3B
 export TRAIN_FILE=/root/data_cached/qwen3-30b-a3b-maxprompt1024/dapo-math-17k.filtered.parquet
 export VAL_FILE=/root/data_cached/qwen3-30b-a3b-maxprompt1024/aime-2024.filtered.parquet
@@ -890,6 +1075,7 @@ docker exec -d \
 export PATH=/opt/venv/bin:$PATH
 export RL_ROOT=/workspace
 export DATA_ROOT=/runtime
+export AITER_DIR=/workspace/aiter
 export MODEL_PATH=/root/models/Qwen3-30B-A3B
 export TRAIN_FILE=/root/data_cached/qwen3-30b-a3b-maxprompt1024/dapo-math-17k.filtered.parquet
 export VAL_FILE=/root/data_cached/qwen3-30b-a3b-maxprompt1024/aime-2024.filtered.parquet
@@ -1174,8 +1360,11 @@ examples/GRPO/configs/grpo_qwen3_30b_a3b_vllm_ep8_longrun.yaml
 
 ## 19. 参考
 
-- LumenRL：`https://github.com/ZhangDanyang-AMD/Lumen-RL.git`
-- LumenRL branch：`origin/dev/moe-grpo`
+- LumenRL：`https://github.com/ZhangDanyang-AMD/Lumen-RL/tree/dev/moe-grpo`
+- Lumen：`https://github.com/ZhangDanyang-AMD/Lumen/tree/dev/qwen3-30b-a3b`
+- Megatron-LM（ROCm fork）：`https://github.com/ROCm/Megatron-LM/tree/rocm_dev`
+- aiter：`https://github.com/ZhangDanyang-AMD/aiter/tree/lumen/qwen3-30b-a3b`
+- flash-attention：`https://github.com/ROCm/flash-attention`
 - LMSYS MILES RL on AMD：
   `https://www.lmsys.org/blog/2026-03-17-rocm-miles-rl-amd/`
 - MILES：`https://github.com/radixark/miles`
