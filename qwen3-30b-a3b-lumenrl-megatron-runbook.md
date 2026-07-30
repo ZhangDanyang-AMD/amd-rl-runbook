@@ -13,11 +13,13 @@
 2. 在每台主机自动发现 Ray node IP、RoCE HCA、网卡、GID index 和 RoCE IP。
 3. 互相验证 Ray 网络和 RoCE 网络可达。
 4. 从 `origin/dev/moe-grpo` 拉取一致的 LumenRL 代码。
-5. 启动带 GPU 和 `/dev/infiniband` 的容器并核对软件版本。
-6. 启动两节点 Ray 集群。
-7. 用发现结果生成本次部署专用 YAML，不修改仓库中的基准 YAML。
-8. 先跑 3-step RDMA smoke，通过后再启动 200-step longrun。
-9. 持续检查 NaN、RDMA transport、验证指标和完整 optimizer checkpoint。
+5. 如果 `Lumen-RL/examples/GRPO/Dockerfile` 存在，优先用它分别构建 rollout/trainer 镜像；
+   只有 Dockerfile 不存在时才在运行容器中手工安装依赖。
+6. 启动带 GPU 和 `/dev/infiniband` 的容器并核对软件版本。
+7. 启动两节点 Ray 集群。
+8. 用发现结果生成本次部署专用 YAML，不修改仓库中的基准 YAML。
+9. 先跑 3-step RDMA smoke，通过后再启动 200-step longrun。
+10. 持续检查 NaN、RDMA transport、验证指标和完整 optimizer checkpoint。
 
 目标角色由运行时变量决定：
 
@@ -448,10 +450,121 @@ echo “fa:         $(cd “$FA_HOST_DIR” && git rev-parse HEAD)”
 | triton_kernels | `1.0.0+amd.rocm7.2.0.git89002410` |
 | 基础镜像附带 ATOM | `0.1.6rc1.dev117+g3321d0ff0`（当前 flow 不使用） |
 
-LumenRL、Lumen、aiter、flash-attention 通过 `pip install -e` 从挂载的源码目录安装。
-Megatron-LM 通过 `.pth` 文件引入（因为其 `pyproject.toml` 的
-`packages.find` 只包含 `megatron.core`，`pip install -e` 不会安装 `megatron.training`）。
-不能用 PyPI 的 `megatron-core`——它既没有 `megatron.training`，也没有 `RouterReplay`。
+使用 GRPO Dockerfile 时，LumenRL、Lumen、aiter、flash-attention 和 Megatron-LM 已经烘焙到镜像；
+不再依赖容器启动后的手工安装。fallback 流程仍通过 `pip install -e` 和 `.pth` 使用挂载源码。
+不能用缺少 `megatron.training` 或 `RouterReplay` 的通用 PyPI `megatron-core` 替代已验证 ROCm
+Megatron-LM。
+
+### 5.4 优先用 GRPO Dockerfile 构建环境
+
+如果以下文件存在：
+
+```text
+${LUMENRL_HOST_DIR}/examples/GRPO/Dockerfile
+```
+
+必须优先使用它构建环境。该 Dockerfile 使用同一份 LumenRL build context，但提供两个独立 target：
+
+| target | 默认基础镜像 | 输出镜像 | 用途 |
+|---|---|---|---|
+| `rollout` | `rocm/atom-dev:vllm-latest` | `qwen3-30b-a3b:rollout` | Ray head + vLLM TP2 × 4 |
+| `trainer` | `rocm/atom-dev:latest` | `qwen3-30b-a3b:trainer` | Megatron TP4/EP8 |
+
+两个 target 不能合并成同一运行镜像。rollout 的 vLLM、NumPy 和 Triton build 与 trainer 不同；
+强行统一会破坏已经验证的 vLLM/ROCm 组合。
+
+Docker build context 必须是 **Lumen-RL 仓库根目录**，不能是
+`examples/GRPO/`：
+
+```bash
+source "$HOME/qwen3-rdma-node.env"
+DOCKERFILE="$LUMENRL_HOST_DIR/examples/GRPO/Dockerfile"
+test -f "$DOCKERFILE" || {
+  echo "GRPO Dockerfile 不存在，使用 §7 fallback 安装流程"
+  export USE_GRPO_DOCKERFILE=0
+}
+```
+
+#### rollout 节点构建
+
+只在 rollout 节点执行：
+
+```bash
+source "$HOME/qwen3-rdma-node.env"
+cd "$LUMENRL_HOST_DIR"
+
+docker build --network=host --progress=plain \
+  -f examples/GRPO/Dockerfile \
+  --target rollout \
+  -t qwen3-30b-a3b:rollout \
+  .
+
+export ROLLOUT_IMAGE=qwen3-30b-a3b:rollout
+export USE_GRPO_DOCKERFILE=1
+cat >> "$HOME/qwen3-rdma-node.env" <<EOF
+export ROLLOUT_IMAGE='$ROLLOUT_IMAGE'
+export USE_GRPO_DOCKERFILE=1
+EOF
+```
+
+#### trainer 节点构建
+
+只在 trainer 节点执行：
+
+```bash
+source "$HOME/qwen3-rdma-node.env"
+cd "$LUMENRL_HOST_DIR"
+
+docker build --network=host --progress=plain \
+  -f examples/GRPO/Dockerfile \
+  --target trainer \
+  -t qwen3-30b-a3b:trainer \
+  .
+
+export TRAIN_IMAGE=qwen3-30b-a3b:trainer
+export USE_GRPO_DOCKERFILE=1
+cat >> "$HOME/qwen3-rdma-node.env" <<EOF
+export TRAIN_IMAGE='$TRAIN_IMAGE'
+export USE_GRPO_DOCKERFILE=1
+EOF
+```
+
+首次构建会编译 gfx942 的 aiter、flash-attention 和 Lumen HIP extension，通常需要较长时间。
+后续相同源码和 build args 会复用 Docker layer cache。需要强制重建时才添加 `--no-cache`。
+
+Dockerfile 支持覆盖基础镜像和源码 ref。例如固定 rollout 基础镜像 digest：
+
+```bash
+docker build --network=host --progress=plain \
+  -f examples/GRPO/Dockerfile \
+  --target rollout \
+  --build-arg ROLLOUT_BASE_IMAGE='rocm/atom-dev@sha256:<digest>' \
+  --build-arg LUMEN_REF='<commit>' \
+  --build-arg MEGATRON_REF='<commit>' \
+  --build-arg AITER_REF='<commit>' \
+  --build-arg FLASH_ATTN_REF='<commit>' \
+  -t qwen3-30b-a3b:rollout \
+  .
+```
+
+正式复现时应把两个基础镜像都换成 digest，并把四个源码 ref 都换成已验证 commit。
+Dockerfile 在构建末尾会检查 PyTorch/HIP、Ray、Transformers、flash-attn、AITER、NumPy、
+Triton、vLLM 和 Megatron import；版本不匹配会直接令 build 失败。
+
+构建完成后核对目标和镜像 ID：
+
+```bash
+docker image inspect qwen3-30b-a3b:rollout \
+  --format 'rollout {{.Id}} {{index .Config.Labels "org.opencontainers.image.title"}}' \
+  2>/dev/null || true
+docker image inspect qwen3-30b-a3b:trainer \
+  --format 'trainer {{.Id}} {{index .Config.Labels "org.opencontainers.image.title"}}' \
+  2>/dev/null || true
+```
+
+如果只在一台 build 主机构建，可把两个镜像推送到内部 registry，或使用
+`docker save` / `docker load` 传到对应节点。两节点最终必须使用各自角色的 target，不能把
+`trainer` 镜像放到 rollout 节点。
 
 ## 6. 启动 Docker
 
@@ -472,6 +585,16 @@ devices=/dev/kfd,/dev/dri,/dev/infiniband
 
 ```bash
 source "$HOME/qwen3-rdma-node.env"
+SOURCE_MOUNTS=()
+if [ "${USE_GRPO_DOCKERFILE:-0}" != "1" ]; then
+  SOURCE_MOUNTS=(
+    -v "$LUMENRL_HOST_DIR":/workspace/Lumen-RL
+    -v "$LUMEN_HOST_DIR":/workspace/Lumen
+    -v "$MEGATRON_HOST_DIR":/workspace/Megatron-LM
+    -v "$AITER_HOST_DIR":/workspace/aiter
+    -v "$FA_HOST_DIR":/workspace/flash-attention
+  )
+fi
 docker rm -f "$CONTAINER" 2>/dev/null || true
 docker run -d --name "$CONTAINER" --entrypoint /bin/bash \
   --network=host --shm-size=64g \
@@ -479,11 +602,7 @@ docker run -d --name "$CONTAINER" --entrypoint /bin/bash \
   --group-add=video \
   --ulimit memlock=-1:-1 --ulimit stack=67108864:67108864 \
   --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
-  -v "$LUMENRL_HOST_DIR":/workspace/Lumen-RL \
-  -v "$LUMEN_HOST_DIR":/workspace/Lumen \
-  -v "$MEGATRON_HOST_DIR":/workspace/Megatron-LM \
-  -v "$AITER_HOST_DIR":/workspace/aiter \
-  -v "$FA_HOST_DIR":/workspace/flash-attention \
+  "${SOURCE_MOUNTS[@]}" \
   -v "$DATASET_HOST_DIR":/root/data_cached \
   -v "$MODEL_HOST_DIR":/root/models \
   -v "$SHARED_HOST_DIR":/shared \
@@ -495,6 +614,16 @@ docker run -d --name "$CONTAINER" --entrypoint /bin/bash \
 
 ```bash
 source "$HOME/qwen3-rdma-node.env"
+SOURCE_MOUNTS=()
+if [ "${USE_GRPO_DOCKERFILE:-0}" != "1" ]; then
+  SOURCE_MOUNTS=(
+    -v "$LUMENRL_HOST_DIR":/workspace/Lumen-RL
+    -v "$LUMEN_HOST_DIR":/workspace/Lumen
+    -v "$MEGATRON_HOST_DIR":/workspace/Megatron-LM
+    -v "$AITER_HOST_DIR":/workspace/aiter
+    -v "$FA_HOST_DIR":/workspace/flash-attention
+  )
+fi
 docker rm -f "$CONTAINER" 2>/dev/null || true
 docker run -d --name "$CONTAINER" --entrypoint /bin/bash \
   --network=host --shm-size=64g \
@@ -502,11 +631,7 @@ docker run -d --name "$CONTAINER" --entrypoint /bin/bash \
   --group-add=video \
   --ulimit memlock=-1:-1 --ulimit stack=67108864:67108864 \
   --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
-  -v "$LUMENRL_HOST_DIR":/workspace/Lumen-RL \
-  -v "$LUMEN_HOST_DIR":/workspace/Lumen \
-  -v "$MEGATRON_HOST_DIR":/workspace/Megatron-LM \
-  -v "$AITER_HOST_DIR":/workspace/aiter \
-  -v "$FA_HOST_DIR":/workspace/flash-attention \
+  "${SOURCE_MOUNTS[@]}" \
   -v "$DATASET_HOST_DIR":/root/data_cached \
   -v "$MODEL_HOST_DIR":/root/models \
   -v "$SHARED_HOST_DIR":/shared \
@@ -520,10 +645,18 @@ docker run -d --name "$CONTAINER" --entrypoint /bin/bash \
 - rollout 节点必须使用包含当前 ROCm vLLM build 的镜像。
 - trainer 节点不需要安装 vLLM。
 - 两节点容器必须使用 `--network=host`，否则 Ray IP、RoCE IP 与 rendezvous 地址需要重新配置。
+- `USE_GRPO_DOCKERFILE=1` 时不要再挂载宿主机源码覆盖 `/workspace/*`，否则运行的不是构建时已验证代码。
 
-## 7. 从源码安装依赖
+## 7. fallback：在运行容器中从源码安装依赖
 
-所有核心组件从挂载的源码目录构建安装。不使用预编译 wheel。
+本节只在 `Lumen-RL/examples/GRPO/Dockerfile` 不存在，或明确设置
+`USE_GRPO_DOCKERFILE=0` 时执行。
+
+如果 §5.4 已成功构建并使用角色镜像，**跳过 §7.1–§7.6**，直接执行 §7.7 和 §7.8
+做运行时导入及 kernel 验证。不要在已构建镜像启动后再次 `pip install`，否则会破坏
+Dockerfile 构建末尾验证过的版本矩阵。
+
+fallback 模式下，所有核心组件从挂载的源码目录构建安装。不使用预编译 wheel。
 不要重装 torch、Triton 或容器镜像自带的 vLLM（rollout 节点）。
 
 ### 7.1 aiter（两节点都需要，含 HIP C++ 编译）
