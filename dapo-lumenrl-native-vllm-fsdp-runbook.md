@@ -1160,7 +1160,24 @@ sudo docker exec "$CONTAINER" bash -lc '
 长跑配置引用 `${oc.env:SCRATCH_ROOT}`，`ENVX` 里必须带上它，见 §13.6。
 
 **`HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION` in `chunk_cat_cuda_kernel`**
-实测在长跑 step 128（21.5 小时）出现过一次，整个 Ray job 随 actor 一起死。
+
+**已复现两次，是这条线目前最大的稳定性问题。**两次都在反向的 reduce-scatter copy-in，
+整个 Ray job 随出事的 actor 一起死：
+
+| | 第一次 | 第二次 |
+|---|---|---|
+| 配置 | 旧配置（batch 512、R3 开） | verlref（batch 2048、`gpu_memory_utilization` 0.4） |
+| 崩溃步数 | step 128（21.5 小时） | **step 11（1.9 小时）** |
+| 出事 rank | 3 | **7** |
+| kernel | `chunk_cat_cuda_kernel<float, BFloat16>` | **同一个** |
+| grid | `[19472896, 8, 1]` | `[19447936, 8, 1]` |
+
+**先把"崩在哪"换算成"多久崩一次"**，规律才出来。梯度累积下每个 micro-batch 每层都触发一次
+reduce-scatter copy-in：旧配置每步 `512/8 × 48 = 3,072` 次，verlref 每步 `2048/8 × 48 = 12,288` 次。
+两次崩溃分别在约 **39 万次和 14 万次调用**之后——同一个数量级。
+所以这不是"第 128 步有什么特殊"，而是**热路径上约十万分之一概率的偶发故障**。
+这也解释了为什么隔离复现几十次全是干净的：样本量差了四个数量级。
+
 **这不是 OOM**，别按显存不足去处理：
 
 - OOM 在这套栈上长这样：`torch.OutOfMemoryError: HIP out of memory. Tried to allocate ...` ——
@@ -1172,35 +1189,59 @@ sudo docker exec "$CONTAINER" bash -lc '
   （带 Python traceback），不是内核 OOM killer 的 SIGKILL。主机还剩 2.4TB 内存，容器无内存上限
 - 0 条 amdgpu/kfd/RAS/ECC 内核消息，无 retired HBM page
 
-定位到的信息：faulting kernel 是 `chunk_cat_cuda_kernel<float, BFloat16>`，
-在 FSDP2 里**只有一个调用点** `foreach_reduce_scatter_copy_in` ——
-反向把 bf16 梯度打包进 fp32 的 reduce-scatter 缓冲区。`grid=[19472896, 8, 1]` 对得上：
-grid.y = 8 = world_size，19472896 × 4 elem/work-item = 77,891,584 ≈ 一个 MoE 层的每卡份额
-（623,120,640 / 8）。
+定位到的信息：faulting kernel 在 FSDP2 里**只有一个调用点** `foreach_reduce_scatter_copy_in` ——
+反向把 bf16 梯度打包进 fp32 的 reduce-scatter 缓冲区。grid 对得上：grid.y = 8 = world_size，
+19472896 × 4 elem/work-item = 77,891,584 ≈ 一个 MoE 层的每卡份额（623,120,640 / 8）。
 
 查过但**已排除**的假设：
 
 | 假设 | 结论 |
 |---|---|
 | 显存不足 / OOM | **排除**，见上面四条 |
-| fp32 缓冲区 2.32 GiB 超 2^31 字节导致 int32 溢出 | **排除**。`chunk_cat_repro.py` 用完全相同的形状跑并与切片参考实现逐位比对，128 专家（2.32 GiB）及以下全部 exact；kernel 用的是 64 位索引 |
-| 这块卡的 HBM 坏了 | **未发现**。GPU 3 做 220 GiB 写入回读 ×3 + 复现该形状 ×3 全部干净 |
-| kernel/形状本身有 bug | **不成立**。8 个 rank 每步跑同样形状的同一个 kernel，**只有 rank 3 死了**，其余 7 个正常 |
+| fp32 缓冲区 2.32 GiB 超 2^31 字节导致 int32 溢出 | **排除**。`chunk_cat_repro.py` 用完全相同的形状与切片参考实现逐位比对，128 专家（2.32 GiB）及以下全部 exact；kernel 用的是 64 位索引 |
+| 某块卡的 HBM 坏了 | **排除**。两次死在不同 rank（3、7）；GPU 3 单独做 220 GiB 写入回读 ×3 + 复现该形状 ×3 全部干净 |
+| [pytorch#122026](https://github.com/pytorch/pytorch/issues/122026) 的元数据越界 | **排除**。用它的复现方式 `PYTORCH_NO_CUDA_MEMORY_CACHING=1` 重跑仍然干净（该缺陷 2024 年已由 PR #122076 修掉） |
+| 通信库的特殊内存 aperture | **排除**。FSDP2 默认是 `DefaultReduceScatter`，目标缓冲区就是普通 `torch.empty`；只有调了 `set_allocate_memory_from_process_group` 才走 RCCL 注册内存，LumenRL 没调 |
+| kernel/形状本身有确定性 bug | **不成立**。8 个 rank 每步跑同样形状的同一个 kernel，每次只死一个 |
 
-剩下的可能是一次性野指针：`chunk_cat` 接收的是一个设备端指针数组（`BFloat16**`），
-某个梯度张量若在 kernel 执行前被释放/重分配，或更早的某个 kernel 越界写坏了内存，就是这个现象。
-ROCm 把 abort 归给队列读指针处的 packet，而当时有 ~88 个 packet 在飞（rptr 50676415 / wptr 50676503），
-所以真凶也可能是相邻的 kernel。单次事件无法进一步收敛。
+**尚未解释**：为什么这个 kernel 会偶发访问非法地址。它在隔离环境下怎么测都是对的，
+所以问题多半在并发/内存状态这类隔离测不出来的地方。另外 ROCm 把 abort 归给队列读指针处的 packet，
+当时有 ~88 个 packet 在飞（rptr 50676415 / wptr 50676503），**真凶也可能是相邻的 kernel**。
 
-再遇到时的取证手段：`AMD_SERIALIZE_KERNEL=3` 串行化 kernel 以拿到准确归属（很慢，只在复现时开）；
-本次 GPU coredump 没抓到（日志里 `GPU coredump: execvp failed: No such file or directory`），
-要拿 dump 需要先把 handler 装好。
+#### 规避手段：`LUMENRL_FSDP_CHUNK_CAT_FALLBACK=1`
 
-**实践上更重要的是：存 checkpoint。**这次没存，128 步 21.5 小时全丢 ——
+`lumenrl/engine/training/fsdp_chunk_cat_fallback.py` 把 `foreach_reduce_scatter_copy_in`
+换成普通切片拷贝：同样的字节、同样的布局，只是不走那个融合 kernel。
+每个 layer group 从 1 次 launch 变成 88 次（11 个张量 × 8 个 chunk），
+但每次都是大块连续拷贝，带宽不变，相对 9 分钟的 step 可忽略。加进 `ENVX` 即可：
+
+```bash
+LUMENRL_FSDP_CHUNK_CAT_FALLBACK=1
+```
+生效时每个 actor 打印 `[lumenrl] FSDP2 reduce-scatter copy-in: slicing fallback installed`。
+正确性有 6 项单测（真实 MoE 层形状、需要补零的行数、整块都是 padding 的 chunk、非连续梯度、
+不同 world_size、无 dtype 提升），全部与 `torch._chunk_cat` 逐位一致：
+
+```bash
+sudo docker exec "$CONTAINER" bash -lc 'cd "$RL_ROOT/Lumen-RL" &&
+  python3 -m lumenrl.tests.test_fsdp_chunk_cat_fallback'   # 需要 1 张卡
+```
+
+> ⚠️ **这是规避不是修复，而且有效性尚未确认。**开着 fallback 的长跑写这段时跑到 step 8，
+> 而上次崩在 step 11，**还没越过判据点**。默认关闭。
+>
+> 这个开关同时是个**可证伪的实验**：跑过 step 11 还活着，说明故障确实在那个 kernel；
+> 照样崩，说明 ROCm 的归属误导了我们、真凶在别处 —— 那时再上 `AMD_SERIALIZE_KERNEL=3`
+> 串行化 kernel 拿准确归属（很慢，只在复现时开）。
+> 本次 GPU coredump 没抓到（`GPU coredump: execvp failed: No such file or directory`），
+> 要拿 dump 得先把 handler 装好。
+
+**实践上更重要的是：存 checkpoint。**第一次崩掉 128 步 21.5 小时全丢 ——
 这是 §13.6 关落盘那条路的真实代价。存了的话一次性崩溃只损失 10 步。
 
-**显存**：`mem/actor_max_reserved_gb` 实测 75–95GB（288GB 卡），vLLM 另占 ~86GB。要回退按 §12
-同样的办法降 `max_response_length` / `train_global_batch_size`。
+**显存**：`mem/actor_max_reserved_gb` 在 `gpu_memory_utilization=0.4` 下实测 94–114GB
+（252GiB 的卡，vLLM 另占 ~101GB），余量约 37GB；0.3 时是 85–95GB、余量约 75GB。
+要回退按 §12 同样的办法降 `max_response_length` / `train_global_batch_size`。
 
 ---
 
