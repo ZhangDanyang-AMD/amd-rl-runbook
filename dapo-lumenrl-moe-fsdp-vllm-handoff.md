@@ -10,9 +10,10 @@
 
 ## 一句话现状
 
-Qwen3-30B-A3B-Base 能在这条路径上跑起来，但 `rollout_corr/kl` 会从 0.0005 一路爬到 0.0166（55 步），
-**根因已定位**：IPC 权重同步把**全部融合 MoE 专家张量静默丢弃**，vLLM 的专家永远停在磁盘加载值。
-修复方案已设计好但**尚未实现**——这就是你要做的第一件事。
+**同步 bug 已修复并验证**（2026-07-30，见第 3 节）。此前 `rollout_corr/kl` 会从 0.0005 一路爬到 0.0166（55 步），
+根因是 IPC 权重同步把**全部融合 MoE 专家张量静默丢弃**，vLLM 的专家永远停在磁盘加载值。
+现在融合张量走 vLLM 自己的 `FusedMoE.weight_loader`，并且每次同步都断言覆盖到全部参数。
+下一件事见第 6 节（长跑复测 + 熵坍缩重新评估）。
 
 ---
 
@@ -27,6 +28,7 @@ Qwen3-30B-A3B-Base 能在这条路径上跑起来，但 `rollout_corr/kl` 会从
 | `69634e0` | `feat(r3)` `DataProto.ragged` 一等字段 + R3 采集侧 |
 | `00ff83f` | `feat(r3)` R3 注入侧（训练前向/反向复放 rollout 路由）+ 单元测试 |
 | `f3706fd` | `feat(dapo)` 长跑配置开启 R3，并把同步 bug 写进注释 |
+| （待提交） | `fix(moe)` 融合 MoE 权重同步 + 覆盖率断言 + 4k smoke 配置 + 11 项单测，见第 3 节 |
 
 ```bash
 git -C "$RL_ROOT/Lumen-RL" fetch origin
@@ -37,13 +39,14 @@ git -C "$RL_ROOT/Lumen-RL" log --oneline -5        # 应看到 f3706fd
 
 Lumen-RL 是 editable 安装，改文件下次启动即生效。
 
-先跑 3 个纯 CPU 测试确认代码完整（不需要 GPU、不需要模型）：
+先跑 4 个纯 CPU 测试确认代码完整（不需要 GPU、不需要模型）：
 
 ```bash
 cd "$RL_ROOT/Lumen-RL"
 python3 -m lumenrl.tests.test_dataproto_ragged      # 10 项
 python3 -m lumenrl.tests.test_mismatch_metrics      #  4 项
 python3 -m lumenrl.tests.test_rollout_routing       #  9 项
+python3 -m lumenrl.tests.test_moe_weight_sync       # 11 项（融合 MoE 权重同步）
 ```
 
 ---
@@ -117,40 +120,72 @@ step 54 的 `reward/accuracy` 从 0.14 涨到 0.43 **不可信**——rollout �
 
 ---
 
-## 3. 你的第一件事：修同步
+## 3. 同步修复（已完成，2026-07-30）
 
-### 第 1 步（约 10 分钟，决定方案）：验证布局是否逐元素对应
-`gate_up_proj (128,1536,2048)` 和 `w13_weight (128,1536,2048)` 形状完全一致，但**必须验证内部布局**
-（gate/up 在 dim=1 上的拼接顺序、是否转置）。用磁盘上同一份原始权重交叉验证：
+### 结论：布局逐元素对应
+`moe_layout_probe.py`（在 `$RL_ROOT` 下）把同一份磁盘 checkpoint 分别用 vLLM 和 HF
+`AutoModelForCausalLM` 加载，对 layer 0/1/23/47 逐位比对，全部 **EXACT**：
 
-- 用 vLLM 正常加载 → 取 `w13_weight` / `w2_weight`
-- 用 HF `AutoModelForCausalLM` 加载同一份 → 取 `experts.gate_up_proj` / `down_proj`
-- 逐位比对（注意 dtype：HF 侧 fp32/bf16，vLLM 侧 bf16）
+| HF（transformers 5.12） | vLLM | 结果 |
+|---|---|---|
+| `experts.gate_up_proj (128,1536,2048)` | `experts.w13_weight` | 逐元素相同 |
+| `experts.down_proj (128,2048,768)` | `experts.w2_weight` | 逐元素相同 |
+| `mlp.gate.weight` | `mlp.gate.weight` | 逐元素相同 |
 
-### 第 2 步：按结论实现
-- **若逐元素对应**（推荐路径）：在 `lumenrl/engine/inference/vllm_colocate_worker_ext.py` 里加名字映射，
-  把 `experts.gate_up_proj → experts.w13_weight`、`experts.down_proj → experts.w2_weight` 直接整块 `copy_`。
-  高效，96 个张量照旧。
-- **若不对应**：在发送端（`lumenrl/workers/actor_worker.py` 的 `update_weights_ipc_send`）把融合张量拆成
-  128×3 个 per-expert 张量，用 vLLM 认识的名字发。**这种名字已实测能正确落盘**。
-  代价是张量数从 96 变成 18432，分桶开销上升。
+`w13` 的 dim=1 前半是 gate（vLLM 的 `w1`）、后半是 up（`w3`），
+和 HF `linear(x, gate_up_proj[e]).chunk(2, dim=-1)` 的切法一致。探针同时确认
+`unquantized_backend=TRITON`（`VLLM_ROCM_USE_AITER=0` 下不做 kernel shuffle）、`w13_weight` contiguous 未 padding。
 
-### 第 3 步（必做）：加覆盖率断言
-这个 bug 能藏 54 步，唯一原因是 `load_weights()` 的返回值被丢弃。
-在 `vllm_colocate_worker_ext.py` 的 `update_weights_from_ipc` 里累积各 bucket 的 `loaded_params`，
-最后断言它覆盖 `dict(model.named_parameters()).keys()`。这一条把任何静默漏同步变成显式报错。
+### 实现：`lumenrl/engine/inference/vllm_moe_weight_sync.py`（新文件）
+没有直接 `copy_`，而是把融合张量喂给 **vLLM 自己的 `FusedMoE.weight_loader`**：
+它的 `full_load = loaded_weight.ndim == 3` 分支接受整块 3D 张量，一次 `copy_` 写完全部 128 个专家。
+所以 `gate_up_proj` 拆成 dim=1 的两半（`w1`/`w3` 两次调用）、`down_proj` 整块走 `w2`，
+**每层 3 次 loader 调用**（不是 384 次），TP 切分、hidden-dim padding、加载期 kernel 格式转换全部仍由 vLLM 负责。
 
-同时建议顺手补上 verl 的 `patch_vllm_moe_model_weight_loader`（见
-`verl/verl/utils/vllm/patch.py:77-142` 和 `verl/verl/workers/rollout/vllm_rollout/utils.py:200-205,243-246`）。
-我早前判定它"在这版 vLLM 上无害"——**那个判断是错的**，它正是用来处理融合 MoE 权重加载的。
+- `FusedMoEWeightRouter` 在 `update_weights_from_ipc` 里拦截这些名字，其余照旧走 `model.load_weights`。
+- EP > 1 时自动退回 per-expert 调用（让 vLLM 做 global→local 专家 id 映射）。
+- 稠密模型（8B）上 `active=False`，`route()` 原样返回，零影响。
+- `LUMENRL_WEIGHT_SYNC_VERIFY=1`：加载后把 vLLM buffer 读回来和发送张量 `torch.equal` 比对，
+  不等就抛。相当于 vime 的 `--check-weight-update-equal`，默认关（每步约 +0.1s）。
 
-### 第 4 步：验证
+**不需要 verl 的 `patch_vllm_moe_model_weight_loader`**：那个 patch 是把 `weight_loader` 属性补回 w13/w2 参数上，
+而我们直接调 FusedMoE 模块上的 bound method，不依赖参数属性。vLLM 0.23 的参数上本来也有这个属性
+（磁盘加载走的就是它）。
+
+### 覆盖率断言：`assert_weight_sync_coverage`
+每次同步累积所有 bucket 的 `loaded_params`（含 router 自己加载的），最后要求它覆盖
+`model.named_parameters()`（忽略 `_scale` 等量化产物后缀）。少一个就抛 `RuntimeError` 并列出名字。
+`LUMENRL_WEIGHT_SYNC_CHECK=error|warn|off`，**默认 error**。
+这一条把任何静默漏同步变成第一次同步就崩，而不是 54 步后才从曲线上看出来。
+
+### 单元测试（纯 CPU，11 项）
 ```bash
-# 3 步 smoke，R3 关，看 mismatch/abs_diff 是否在多步后保持平稳（修好前它会涨）
-CONFIG_OVERRIDE=examples/DAPO/configs/dapo_qwen3moe_a3b_ray_vllm_smoke.yaml \
-MODEL_PATH=$DATA_ROOT/models/Qwen3-30B-A3B-Base STEPS=3 MODE=bf16 bash run_dapo.sh
+python3 -m lumenrl.tests.test_moe_weight_sync
 ```
-真正的判据是**长跑 30+ 步 `rollout_corr/kl` 不再单调爬升**。修好前它必然爬。
+假的 FusedMoE 复刻了 vLLM `weight_loader` 里我们依赖的语义（3D 触发 full_load、`w1`/`w3` 对应
+`w13` 的前后半、非本地专家返回 False）。其中 `test_full_round_trip_touches_every_parameter`
+同时跑"有 router"和"没 router"两条路径，后者必须被覆盖率断言抓住——就是这个 bug 的回归测试。
+
+### 验证结果（4k 长度，Qwen3-30B-A3B-Base，R3 开）
+当时用的是 `dapo_qwen3moe_a3b_ray_vllm_4k_smoke.yaml`（5120 total / 4096 response、R3 开、fp32 router）。
+**这个配置连同另外两个旧 MoE 配置已经删掉了**，现在只保留对齐 verl FP8 参考实验的
+`verlref_4k_smoke` / `verlref_longrun`（见 runbook §13.3）。下面的数据留作同步修复的证据，
+但**用现在的配置复现不出这些绝对值**——verlref 关掉了 R3 和 fp32 router，分歧水平会高约 3 倍。
+
+10 步（`$DATA_ROOT/logs/moe-a3b-4k-syncfix.log`）：
+
+| step | 1 | 3 | 5 | 7 | 10 |
+|---|---|---|---|---|---|
+| `rollout_corr/kl` | 0.000545 | 0.000576 | 0.000468 | 0.000600 | 0.000561 |
+| `mismatch/abs_diff` | 0.0121 | 0.0122 | 0.0111 | 0.0111 | 0.0125 |
+
+两条都在噪声里横着（`rollout_corr/kl` 线性斜率 −2.9e-6/步）。`timing/weight_sync_s` 1.14–1.31s，没有性能回退。
+
+另外用 `LUMENRL_WEIGHT_SYNC_VERIFY=1` 跑了 3 步（`moe-a3b-4k-verify.log`），
+96 个融合张量 × 8 replica × 3 次同步全部 `torch.equal` 通过。
+（Ray actor 及其 spawn 出来的 vLLM EngineCore 子进程都能继承 driver 的环境变量，已单独确认。）
+
+稠密 8B BF16 smoke 也跑通（`coverage-check-8b.log`，exit 0），覆盖率断言在稠密路径上不误报。
 
 ---
 
@@ -236,6 +271,8 @@ padded 张量也不行（`[seq,48,8]` uint8 补齐到统一长度，长跑一个
 | 熵坍缩在 log 空间放大数值分歧 | **不是根因**。entropy 与 `abs_diff` 相关 −0.83 只是相关性，entropy 是"训练了多久"的代理 |
 | R3 能解决增长 | **只降水平不压斜率**。R3 修路由，修不了权重本身是错的 |
 | 权重同步对融合 MoE 张量是正确的 | **错**，见第 2 节。我最初的探针推的是 per-expert 名，**那不是训练侧发送的格式**，测错了输入 |
+| 融合张量必须拆成 128×3 个 per-expert 张量才能发 | **不必**。vLLM 的 `FusedMoE.weight_loader` 有 3D `full_load` 分支，整块喂进去即可，见第 3 节 |
+| 需要 verl 的 `patch_vllm_moe_model_weight_loader` | **不需要**，见第 3 节 |
 
 最后一条是最重要的教训：**验证同步时，必须用训练侧 `state_dict()` 里真实的 key 名**，
 先 `torch.load` 一个 checkpoint 分片把 key 打出来，不要凭 HF 文档假设命名。
@@ -244,15 +281,18 @@ padded 张量也不行（`[seq,48,8]` uint8 补齐到统一长度，长跑一个
 
 ## 6. 还没做的事
 
-1. **修同步**（第 3 节）——最高优先级，在此之前任何 MoE 长跑结果都不可用。
-2. `load_weights` 覆盖率断言 + `patch_vllm_moe_model_weight_loader`。
-3. `ppo_kl` 在 R3 开启后从 −3.6e-5 变成 −8.4e-4，涨一个量级，**我没有完整解释**。
+1. **正式长跑已改为对齐 verl 的 FP8 参考实验**（`recipe/low_precision/run_dapo_qwen3_moe_30b_megatron_fp8e2e.sh`
+   的 BF16 基线），配置是 `dapo_qwen3moe_a3b_ray_vllm_verlref_longrun.yaml`，
+   旧的 `dapo_qwen3moe_a3b_ray_vllm_{smoke,4k_smoke,longrun}.yaml` 三个已删除。
+   跑法、逐项映射、以及四处未对齐的差异见 runbook §13.3/§13.6。
+   注意必须带 `LUMENRL_FP32_MOE_ROUTER=0`（verl 用 BF16 router）和 `SCRATCH_ROOT`。
+2. `ppo_kl` 在 R3 开启后从 −3.6e-5 变成 −8.4e-4，涨一个量级，**我没有完整解释**。
    猜测是 old_logprob 前向按整批 `max_tok` 切、训练前向按分发后的分片切，打包组合不同导致 varlen kernel 数值差异。
    绝对值仍远小于告警线，但值得查。
-4. `mismatch/chi2_seq` 在长序列下改成中位数或超阈值占比。
-5. **熵坍缩**：entropy 从 0.835 掉到 0.185（54 步），配置里没有 `entropy_coeff`（继承自 8B longrun）。
-   同步修好后需要重新评估——现在无法区分这是真实的策略坍缩，还是被"用错权重的 rollout"训出来的假象。
-6. 残留的非路由分歧：R3 开启、同步正确之后，仍有 attention/MLP kernel 差异（HF SDPA + 自定义 varlen vs vLLM 自己的实现）。
+3. `mismatch/chi2_seq` 在长序列下改成中位数或超阈值占比。
+4. **熵坍缩**：entropy 从 0.835 掉到 0.185（54 步），配置里没有 `entropy_coeff`（继承自 8B longrun）。
+   4k smoke 前 10 步 entropy 0.86 → 0.65 左右震荡，还看不出趋势，需要长跑重新评估。
+5. 残留的非路由分歧：R3 开启、同步正确之后，仍有 attention/MLP kernel 差异（HF SDPA + 自定义 varlen vs vLLM 自己的实现）。
    注意 **vime 并没有对齐 kernel**，它是靠 R3 + TIS 吸收差异，所以"让训练侧贴近 vLLM kernel"不是 vime 的解法。
 
 ---
@@ -276,11 +316,17 @@ vime（`xysheng-AMD` 那份 checkout）在同一问题上的做法，值得借�
 
 上一台机器 `$RL_ROOT` 下（不在 git 里，需要时按描述重写）：
 
-- `kl_compare.py`：两阶段（vLLM 生成 → HF 重算）对比同权重下的 logprob 分歧，输出有符号均值 + 标准误、
+- `moe_layout_probe.py`：**这台机器上已有**。同一份磁盘 checkpoint 分别用 vLLM 和 HF 加载，
+  逐位比对 `gate_up_proj`/`w13_weight`、`down_proj`/`w2_weight`、router gate，并打印 vLLM 的
+  `unquantized_backend` 和 w13 的 stride（判断有没有 kernel shuffle / ROCm padding）。第 3 节的结论就是它出的。
+  换模型或升级 vLLM/transformers 后重跑一次，能立刻判断整块 `copy_` 是否仍然成立。
+- `parse_run_metrics.py`：**这台机器上已有**。从训练日志里抽每步的 `rollout_corr/kl`、`mismatch/*`、
+  `timing/weight_sync_s`，并给出线性斜率，用来判断分歧是否在爬。
+- `kl_compare.py`（上一台机器，需重写）：两阶段（vLLM 生成 → HF 重算）对比同权重下的 logprob 分歧，输出有符号均值 + 标准误、
   `mean|δ|`、分位数、尾部占比、router top-k 间距分布、bf16→fp32 的翻转率。`--fp32-router` 开关。
-  **修完同步后用它验证**：同权重下 `abs_diff` 应回到 0.0136 量级并且不随步数涨。
-- `moe_sync_probe.py`：用训练侧真实 key 名推张量，检查是否真的写进 vLLM 的 buffer。第 2 节的证据就是它出的。
-- `r3_probe.py`：确认 `enable_return_routed_experts` 在 ROCm 上工作、以及返回的形状/dtype/覆盖范围。
+- `moe_sync_probe.py`（上一台机器）：用训练侧真实 key 名推张量，检查是否真的写进 vLLM 的 buffer。
+  第 2 节的证据就是它出的。**现在这件事由 `LUMENRL_WEIGHT_SYNC_VERIFY=1` 在训练里原地做，不用再写探针。**
+- `r3_probe.py`（上一台机器，需重写）：确认 `enable_return_routed_experts` 在 ROCm 上工作、以及返回的形状/dtype/覆盖范围。
 
 写这类探针时注意：vLLM 的 `collective_rpc` 传闭包需要 `VLLM_ENABLE_V1_MULTIPROCESSING=0`（否则序列化失败），
 `LLM(...)` 构造要包在 `if __name__ == "__main__":` 里（spawn 模式）。

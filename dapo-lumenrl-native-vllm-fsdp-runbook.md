@@ -15,6 +15,9 @@
 >
 > **一句话复现**:设路径变量 → clone 3 仓库 → 起容器装依赖 → 打 vLLM RMSNorm patch → 下模型/数据
 > → 写 1 个启动脚本 → smoke → `docker exec -d` 起长跑。
+>
+> **MoE 见 §13**:同一套环境换成 Qwen3-30B-A3B-Base（BF16 FSDP2 + vLLM），第 2–5 节环境完全复用，
+> 只需补装 `flydsl==0.1.8` 并下模型。第 13 节自带 smoke、长跑、健康判据和专属排障。
 
 ---
 
@@ -434,6 +437,9 @@ $DATA_ROOT/data_cached/qwen3-8b-maxprompt1024/aime-2024.filtered.parquet       #
 | FP8  | `examples/DAPO/configs/dapo_qwen3_8b_ray_vllm_fp8_longrun.yaml`（只差 `vllm_cfg.quantization=fp8_per_block`） |
 | ATOM FP8 | `examples/DAPO/configs/dapo_qwen3_8b_ray_atom_fp8_longrun.yaml`（`generation_backend=atom`、`atom_cfg.transport=ray_http`、`online_quant_config.global_quant_config=per_block_fp8`；启动脚本覆盖为 `no-eager + compilation_config.level=3 + sleep_level=2`；规模/超参与 vLLM FP8 1:1） |
 
+> Qwen3-30B-A3B MoE 的 config 是 `dapo_qwen3moe_a3b_ray_vllm_verlref_{4k_smoke,longrun}.yaml`，
+> 规模/超参不是照抄本节的 8B 表格，而是对齐 verl 的 FP8 参考实验，见 **§13**。
+
 规模/超参(两个 config 相同):
 
 | 项 | 值 |
@@ -804,15 +810,401 @@ sudo docker exec "$CONTAINER" bash -lc '
 
 **ATOM rollout 退化**(`MODE=atomfp8` 时 `filter_groups: kept 0/96` + `Rollout reward: accuracy=0.0000`
 + 日志大量 `finished with reason max`、无 `eos`):rollout 生成崩坏(全部答错、打满 max length)。优先检查
-ATOM `layernorm.py` 的 model-sensitive RMSNorm 是否生效(见 §13);未对齐会表现为
+ATOM `layernorm.py` 的 model-sensitive RMSNorm 是否生效(见 §14);未对齐会表现为
 `rollout_corr/kl` 偏大(~0.007 而非 ~0.004),严重时可能导致生成质量退化。
 
 **ATOM `rollout_corr/kl` 偏大**(~0.007 而非 ~0.004):ATOM `atom/model_ops/layernorm.py` 的 plain
-RMSNorm 未传 `use_model_sensitive_rmsnorm=1`,与训练侧 T5-like RMSNorm 不一致(见 §13 修复)。
+RMSNorm 未传 `use_model_sensitive_rmsnorm=1`,与训练侧 T5-like RMSNorm 不一致(见 §14 修复)。
 
 ---
 
-## 13. FP8 底层 patch 清单（供排查，正常无需手动）
+## 13. Qwen3-30B-A3B MoE（BF16 FSDP2 + vLLM）：smoke 与长跑
+
+同一套环境换一个 MoE policy：Qwen3-30B-A3B-Base（30.5B 总参 / 3.3B 激活，48 层、128 专家、top-8）。
+训练侧仍是 FSDP2，rollout 仍是同卡 colocated vLLM `AsyncLLM`(TP=1) + ZMQ CUDA-IPC 权重同步。
+**第 2–5 节的环境完全复用**，新机器只需再做两件事：装 `flydsl==0.1.8`（§13.1）和下模型（§13.2）。
+数据、启动脚本、监控、停止全部照旧。
+
+规模/超参**不再照抄 §7 的 8B 表格**，而是对齐 verl 的 FP8 参考实验
+（`recipe/low_precision/run_dapo_qwen3_moe_30b_megatron_fp8e2e.sh`）的 BF16 基线，见 §13.3。
+
+> 这条线**不是** Megatron+EP。Megatron 那条见 `dapo-lumenrl-megatron-moe-ep-handoff.md`，别混。
+> 调试历史与已排除的假设见 `dapo-lumenrl-moe-fsdp-vllm-handoff.md`。
+
+### 13.1 相对 8B 路线的差异（只有这些）
+
+| 项 | 8B dense | Qwen3-30B-A3B MoE |
+|---|---|---|
+| 模型 | `Qwen/Qwen3-8B-Base` | **`Qwen/Qwen3-30B-A3B-Base`**，必须 Base 版 |
+| `flydsl` | 镜像自带 0.1.4.2 可用 | **必须升到 0.1.8** |
+| `aiter setup.py develop` | FP8/ATOM 需要 | BF16 **不需要**(`VLLM_ROCM_USE_AITER=0`) |
+| §5 vLLM RMSNorm patch | FP8 必需 | BF16 **不需要** |
+| 数据 | `data_cached/qwen3-8b-maxprompt1024/` | **同一份直接复用**（两个模型 tokenizer 字节相同） |
+| MoE 专属 | — | R3 路由复放 + 融合专家权重同步 + 同步覆盖率断言 |
+
+**为什么必须是 Base 版**：instruct/thinking 版的 Qwen3-30B-A3B 在 `max_response_length` 内**永远不闭合
+`</think>`**（实测给到 3072 token 仍不闭合、也不出 `\boxed`），于是每条样本都被截断、reward 恒为 −1、
+`filter_groups` 连续 10 轮 kept 0，直接抛 `RuntimeError: filter_groups collected no valid groups`。
+Base 版能正常输出 `Answer:`。
+
+**flydsl 0.1.8**：镜像自带的 0.1.4.2 会让 `from aiter import flash_attn_varlen_func` 报版本不兼容，
+训练**前向直接挂**。这一步必做：
+
+```bash
+sudo docker exec "$CONTAINER" bash -lc 'pip install "flydsl==0.1.8" && python3 -c "
+import flydsl, transformers, vllm
+print(\"flydsl\", flydsl.__version__, \"transformers\", transformers.__version__, \"vllm\", vllm.__version__)"'
+```
+> 期望 `flydsl 0.1.8 transformers 5.12.0 vllm 0.23.0`（`pip list` 里显示为 `0.23.0+rocm723`）。
+> transformers **5.x 是必需的**，它把 Qwen3-MoE 的专家融合成 3D 张量，仓库的权重同步按这个布局写。
+
+### 13.2 下载模型（数据不用重下）
+
+```bash
+sudo docker exec "$CONTAINER" bash -lc '
+hf download Qwen/Qwen3-30B-A3B-Base \
+  --local-dir "$DATA_ROOT/models/Qwen3-30B-A3B-Base" --max-workers 8'
+du -sh "$DATA_ROOT/models/Qwen3-30B-A3B-Base"   # 约 57G
+```
+中国内网走 ModelScope（ID 同名 `Qwen/Qwen3-30B-A3B-Base`），用法照抄 §6.1 的 modelscope 片段。
+
+**数据直接复用 §6.2 的产物**，不需要重新过滤：Qwen3-8B-Base 与 Qwen3-30B-A3B-Base 的
+`tokenizer.json` / `vocab.json` / `merges.txt` 三个文件 md5 完全相同（vocab 151936），
+所以按 8B tokenizer 过滤出的 prompt ≤1024 对 MoE 同样成立。
+
+### 13.3 config 与规模（对齐 verl 的 FP8 参考实验）
+
+只有两个 config，都是 verl `recipe/low_precision/run_dapo_qwen3_moe_30b_megatron_fp8e2e.sh`
+的逐项移植（对应 verl `docs/low_precision/fp8.md` 的 "FP8 End-to-End → Qwen3-30B-A3B MoE Model"）。
+verl 那张图有三条曲线（BF16 / FP8 E2E / FP8-rollout-only），**我们复现的是 BF16 那条**，
+也就是 FP8 结果所对标的基线。
+
+| 用途 | config | 规模 |
+|---|---|---|
+| **4k smoke** | `dapo_qwen3moe_a3b_ray_vllm_verlref_4k_smoke.yaml` | prompt=2048, resp=4096, 8 prompt × 16, gen_batch=24, 3 步 |
+| 长跑 | `dapo_qwen3moe_a3b_ray_vllm_verlref_longrun.yaml` | prompt=2048, resp=20480, **128 prompt × 16 = 2048 序列**, gen_batch=384, 1000 步 |
+
+verl 脚本里的参数原样搬过来的部分：
+
+| verl | 值 | LumenRL |
+|---|---|---|
+| `max_prompt_length` / `max_response_length` | 2048 / 20480 | `max_total_sequence_length: 22528` / `max_response_length: 20480` |
+| `train_prompt_bsz` × `n_resp_per_prompt` | 128 × 16 | `train_global_batch_size: 2048`（**是序列数**） |
+| `gen_prompt_bsz` | 384（=128×3） | `gen_batch_size: 384`（**是 prompt 数**） |
+| `train_prompt_mini_bsz` | 128（= bsz，单次更新） | 无 mini-batch 切分，语义相同 |
+| lr / wd / clip_grad / entropy_coeff | 1e-6 / 0.1 / 1.0 / 0 | 同 |
+| **lr warmup** | **0**（`lr_warmup_steps_ratio=0.0`） | `lr_warmup_steps: 0` |
+| clip 0.2/0.28/10 · token-mean · grpo | 同 | 同 |
+| overlong_buffer 512 / 1.0 | 同 | 同 |
+| filter_groups acc / 10 | 同 | 同 |
+| `rollout_is` / C | token / 2.0 | 同 |
+| temperature/top_p/top_k | 1.0/1.0/−1 | 同 |
+| `max_num_batched_tokens` / `max_num_seqs` | 32768 / 256 | 同 |
+| `test_freq` | 10 | `val_steps: 10` |
+
+⚠️ **注意单位**：`train_global_batch_size` 是**序列数**，`gen_batch_size` 是 **prompt 数**。
+LumenRL 用 `train_prompts = train_global_batch_size // num_generations` 反推 prompt 数，
+所以 verl 的 "prompt batch size 128" 对应的是 `2048`，不是 `128`。
+
+**MoE router 用 BF16，这是刻意的**。verl 那个脚本把 fp32 那行注释掉了，理由写在注释里：
+vLLM 的 Qwen3-MoE router 本来就是 BF16，两侧对齐比单侧提精度更重要，而且他们两侧都试过 fp32、
+没有精度收益。我们自己 15k token 的 A/B 也是同一结论。所以跑这两个 config **必须带
+`LUMENRL_FP32_MOE_ROUTER=0`**（LumenRL 默认是 fp32），日志里应看到
+`[lumenrl] MoE router patched on 48 gates (fp32=False)`。
+顺带一提这在 verl 里是特例——其它 18 个 MoE 脚本都显式设了 `moe_router_dtype=fp32`。
+
+**R3（Rollout Routing Replay）默认关**，因为 verl 这个 recipe 没有它。R3 让训练侧复放 rollout
+实际选中的 top-k 专家，实测（3 步 smoke，R3 是唯一变量）`rollout_corr/kl` 0.00160→0.00044、
+`mismatch/chi2_seq` 1.33e6→1.35、step 时间 +4.2%。要开来做 A/B：
+`EXTRA_OVERRIDE='moe.r3.rollout_replay=true'`。
+
+因为环境/硬件差异而**没能对齐**的四项（都只影响吞吐，不改变优化问题）：
+
+| 项 | verl | 这里 | 原因 |
+|---|---|---|---|
+| 训练后端 | Megatron + Megatron-Bridge | FSDP2 | 这条线就是 FSDP2；verl 另有一个 FSDP 版但那是 FP8-rollout-only |
+| GPU | 2×8 H100 | 1×8 MI350X | 同样的 global batch，一半的卡，约 2 倍 step 时间 |
+| rollout 并行 | `gen_tp=2` | TP=1 每卡一个 colocated replica | 架构差异 |
+| `gpu_memory_utilization` | 0.5 | **0.4** | verl 生成时把参数/优化器 offload 到 CPU，LumenRL 的 Ray 路径不支持，训练显存常驻 |
+| 验证采样 | temperature 0.6, top_p 1.0, n=1 | greedy | LumenRL val 是 greedy，仅诊断用，不影响训练 |
+
+**数据集不用另做**：verl 用 `max_prompt_length=2048`，而 §6.2 产出的缓存是按 1024 过滤的——
+实测按 2048 重新过滤 DAPO-Math-17k **一行都不删**（1,791,700 → 1,791,700，AIME 960 → 960），
+这个数据集里没有超过 1024 token 的 prompt，两个切法是同一份数据。
+
+### 13.4 融合专家权重同步（这条线的关键修复，已在仓库里）
+
+transformers 5.x 把 MoE 专家存成融合 3D 张量，训练侧 `state_dict()` 发的是
+`model.layers.N.mlp.experts.gate_up_proj` / `down_proj`，而 vLLM 把同样的 buffer 叫
+`experts.w13_weight` / `w2_weight`，其 `expert_params_mapping` 只认 per-expert 名。
+**融合名匹配不上任何 mapping，会走 vLLM 的静默 `continue` 分支**：不报错、不加载，
+96 个融合专家张量（约 57GB、**93% 的参数**）每次同步全被丢弃，rollout 引擎的专家永远停在磁盘加载值。
+
+`lumenrl/engine/inference/vllm_moe_weight_sync.py`（commit `3aab539`）修掉了它，并加了覆盖率断言。
+**`git pull` 到 `dev/vllm-fsdp-dapo` 最新即可，不需要手动做任何事。**先跑纯 CPU 测试确认代码完整：
+
+```bash
+sudo docker exec "$CONTAINER" bash -lc 'cd "$RL_ROOT/Lumen-RL" &&
+  python3 -m lumenrl.tests.test_moe_weight_sync &&      # 11 项，融合专家同步
+  python3 -m lumenrl.tests.test_rollout_routing &&      #  9 项，R3
+  python3 -m lumenrl.tests.test_dataproto_ragged &&     # 10 项
+  python3 -m lumenrl.tests.test_mismatch_metrics'       #  4 项
+```
+
+两个自检开关：
+
+| 环境变量 | 默认 | 作用 |
+|---|---|---|
+| `LUMENRL_WEIGHT_SYNC_CHECK` | `error` | 每次同步断言 `loaded` 覆盖 `named_parameters()`，漏一个就抛。可设 `warn` / `off` |
+| `LUMENRL_WEIGHT_SYNC_VERIFY` | `0` | `1` = 加载后把 vLLM buffer 读回来和发送张量 `torch.equal` 比对，不等就抛（约 +0.1s/步） |
+
+覆盖率断言默认开着，**新机器第一次跑 MoE 建议再加一次 `VERIFY=1` 的短跑**做端到端确认：
+
+```bash
+S=$RL_ROOT/Lumen-RL/examples/DAPO/run_dapo.sh
+ENVX="export RL_ROOT='$RL_ROOT' DATA_ROOT='$DATA_ROOT' PYTORCH_CUDA_ALLOC_CONF=;"
+sudo docker exec "$CONTAINER" bash -lc "$ENVX LUMENRL_WEIGHT_SYNC_VERIFY=1 LUMENRL_FP32_MOE_ROUTER=0 \
+  CONFIG_OVERRIDE=examples/DAPO/configs/dapo_qwen3moe_a3b_ray_vllm_verlref_4k_smoke.yaml \
+  MODEL_PATH=\$DATA_ROOT/models/Qwen3-30B-A3B-Base STEPS=3 MODE=bf16 \
+  LOG=\$DATA_ROOT/logs/moe-verify.log bash '$S'; tail -40 \"\$(cat /tmp/run_dapo_log.txt)\""
+```
+> 通过的判据是**没有异常**：跑完 exit 0 就说明 96 个融合张量 × 8 replica × 3 次同步全部逐位一致。
+> 失败会抛 `weight sync verify failed for ... shard w1/w3/w2` 或
+> `weight sync (colocate-ipc) left N/M rollout parameters untouched: ...`。
+
+### 13.5 Smoke（4k，3 步，前台等结果）
+
+```bash
+S=$RL_ROOT/Lumen-RL/examples/DAPO/run_dapo.sh
+ENVX="export RL_ROOT='$RL_ROOT' DATA_ROOT='$DATA_ROOT' PYTORCH_CUDA_ALLOC_CONF=;"
+
+sudo docker exec "$CONTAINER" bash -lc "$ENVX LUMENRL_FP32_MOE_ROUTER=0 \
+  CONFIG_OVERRIDE=examples/DAPO/configs/dapo_qwen3moe_a3b_ray_vllm_verlref_4k_smoke.yaml \
+  MODEL_PATH=\$DATA_ROOT/models/Qwen3-30B-A3B-Base STEPS=3 MODE=bf16 \
+  LOG=\$DATA_ROOT/logs/moe-a3b-4k-smoke.log bash '$S'; \
+  tail -40 \"\$(cat /tmp/run_dapo_log.txt)\""
+```
+> `MODEL_PATH` 必须显式给 —— `run_dapo.sh` 的默认值是 8B。
+> `LUMENRL_FP32_MOE_ROUTER=0` 也必须给，否则 router 会走 LumenRL 默认的 fp32，和 verl 对不上。
+
+实测（8×MI350X，3 步约 10 分钟，其中约 5 分钟是 8 个 actor 各自加载 57GB 模型）：
+
+| step | 1 | 2 | 3 |
+|---|---|---|---|
+| `rollout_corr/kl` | 0.00150 | 0.00181 | 0.00149 |
+| `mismatch/abs_diff` | 0.0201 | 0.0218 | 0.0234 |
+| `reward/accuracy` | 0.102 | 0.102 | 0.133 |
+
+Smoke 期望证据：
+- `RLTrainer.setup (ray-controller) complete: ... actor_workers=8`
+- **`[lumenrl] MoE router patched on 48 gates (fp32=False)`** —— `False` 才是对的，`True` 说明忘了传 `LUMENRL_FP32_MOE_ROUTER=0`
+- 第 1 步的 `lr` 就是 `9.99998e-07`（满值），说明 warmup 确实是 0；如果看到 `2e-07` 说明用错了配置
+- `rollout_corr/kl` 在 **1.5e-3 量级**，且不随步数单调爬升。这个水平比我们自己那条线（R3 + fp32 router）高约 3 倍，
+  **是预期内的** —— verl 文档原话就是 "rollout & training distribution mismatch is in general higher for MoE,
+  rollout correction required even for BF16"，这个 recipe 两个 mismatch 抑制手段都没有。
+  `mismatch/chi2_seq` 会到 e6 量级，同样是 R3 关闭时的已知水平
+- 修复权重同步之前，`rollout_corr/kl` 会从 0.0005 一路爬到 0.0166（55 步，与 step 相关 +0.98）
+- `timing/weight_sync_s` 约 1.1–1.7s；`mem/actor_max_reserved_gb` 约 75–115GB
+- 不应出现 `left N/M rollout parameters untouched`（同步漏了）或 `filter_groups collected no valid groups`（用错了 instruct 版模型）
+
+### 13.6 长跑
+
+**先看磁盘**。MoE 的 FSDP2 checkpoint 是 **~342GB**（fp32 权重 + optimizer state × 8 分片，
+= 8B 那份 90GB 按参数量线性放大）。`save_steps=10` / `save_total_limit=1` 时峰值就是一份
+（`CheckpointCallback` 会**先删旧的再写新的**，commit `1e01aef`），但仍然需要 342GB 可用空间。
+
+```bash
+df -h "$DATA_ROOT"     # 至少 400G 可用才谈得上存 checkpoint
+```
+
+长跑配置的 `policy.model_name` / `checkpoint_dir` 用的是 `$SCRATCH_ROOT`（本地大容量盘）。
+**这个变量必须导出**，否则 omegaconf 解析 `${oc.env:SCRATCH_ROOT}` 直接失败：
+
+```bash
+S=$RL_ROOT/Lumen-RL/examples/DAPO/run_dapo.sh
+ENVX="export RL_ROOT='$RL_ROOT' DATA_ROOT='$DATA_ROOT' SCRATCH_ROOT='$DATA_ROOT' \
+LUMENRL_FP32_MOE_ROUTER=0 PYTORCH_CUDA_ALLOC_CONF=;"
+
+# 空间够（≥400G）：正常存 checkpoint
+sudo docker exec -d "$CONTAINER" bash -lc "$ENVX \
+  CONFIG_OVERRIDE=examples/DAPO/configs/dapo_qwen3moe_a3b_ray_vllm_verlref_longrun.yaml \
+  MODEL_PATH=\$DATA_ROOT/models/Qwen3-30B-A3B-Base STEPS=1000 MODE=bf16 \
+  LOG=\$DATA_ROOT/logs/longrun-moe-a3b.log bash '$S'"
+
+# 空间不够：关掉落盘（崩了只能从头跑，先想清楚）
+sudo docker exec -d "$CONTAINER" bash -lc "$ENVX \
+  CONFIG_OVERRIDE=examples/DAPO/configs/dapo_qwen3moe_a3b_ray_vllm_verlref_longrun.yaml \
+  MODEL_PATH=\$DATA_ROOT/models/Qwen3-30B-A3B-Base STEPS=1000 MODE=bf16 \
+  EXTRA_OVERRIDE='checkpointing.save_steps=1000000 checkpointing.resume=false' \
+  LOG=\$DATA_ROOT/logs/longrun-moe-a3b.log bash '$S'"
+```
+> `SCRATCH_ROOT` 即使关掉落盘也要给 —— config 里 `checkpoint_dir` 引用了它，omegaconf 解析不到直接退出。
+
+> ⚠️ 关落盘**不要写 `checkpointing.checkpoint_dir=`**。Hydra 会把空值解析成 `None`，
+> omegaconf 立刻报 `Incompatible value 'None' for field of type 'str'` 并退出。
+> 用 `save_steps` 设成一个跑不到的大数才是干净的做法。
+
+W&B（可选，`$RL_ROOT/wandb.key` 里放 `WANDB_API_KEY=xxxx`，脚本自动读）。MoE 长跑默认进
+`LUMEN-RL-MOE` 项目，换 run 名：`EXTRA_OVERRIDE='logger.wandb.name=<your-name>'`。
+
+### 13.7 健康判据
+
+verl 对齐的长跑（`verlref_longrun`）**尚未跑完，本节还没有它的实测曲线**。
+下表是同一条代码路径上早先一版长跑的 127 步数据，配置不同（batch 512 = 32 prompt × 16、
+prompt 预算 1024、**R3 开 + fp32 router**、lr warmup 10 步），所以**绝对数值不能当成
+verlref 配置的期望值**——verlref 关掉了 R3 和 fp32 router，`rollout_corr/kl` 会高约 3 倍。
+可以当成期望值的是**趋势**和 step 时间量级。
+
+| 指标（旧配置，仅供趋势参考） | step 1 | step 40 | step 80 | step 127 |
+|---|---|---|---|---|
+| `rollout_corr/kl` | 0.000595 | 0.000255 | 0.000242 | 0.000192 |
+| `mismatch/abs_diff` | 0.0136 | 0.00504 | 0.00420 | 0.00308 |
+| `reward/accuracy` | 0.119 | 0.514 | 0.434 | 0.406 |
+| `entropy` | 0.998 | 0.152 | 0.104 | 0.0686 |
+| `grad_norm` | 0.187 | 0.165 | 0.126 | 0.0743 |
+
+- **step 时间约 8–11 分钟**（resp=20480、batch 512，`gen_s` 占 500–600s），比 8B 的 4–5 分钟慢一倍。
+  verlref 的 batch 是它的 4 倍（2048 序列），单步会更长
+- `timing/weight_sync_s` 全程 1.1–1.2s，不随步数增长
+- step 120 的 AIME 验证 `val-core/acc/mean@1 = 0.226`
+- **最关键的判据是 `rollout_corr/kl` 不随步数单调爬升。**它降下去是正常的（策略收敛变确定，
+  log 空间分歧自然缩小）；**爬上去说明权重同步又漏了**，回到 §13.4 用 `VERIFY=1` 复查
+- **已知问题：熵坍缩。**entropy 127 步从 0.998 掉到 0.069，`reward/accuracy` 在 step 40 冲到 0.51
+  之后就在 0.41–0.59 横着不涨。verl 的 recipe 同样是 `entropy_coeff=0`，所以 verlref 大概率
+  会重现这个现象。这是在权重同步正确的前提下测到的，是**真实的策略坍缩**，不是同步 bug 的假象
+
+### 13.8 MoE 专属排障
+
+**`weight sync (colocate-ipc) left N/M rollout parameters untouched: ...`**
+同步漏了参数。异常信息会列出前 8 个名字：若是 `...experts.w13_weight` / `w2_weight`，说明融合 MoE
+路由没生效——要么代码没拉到最新，要么 vLLM/transformers 升级后布局假设失效了。
+后者用下面这个探针重新验证：它把同一份 checkpoint 分别用 HF 和 vLLM 加载，逐位比对
+`gate_up_proj`/`w13_weight`、`down_proj`/`w2_weight`，并打印 vLLM 的 `unquantized_backend`
+（必须是 `TRITON`；若是 `AITER` 说明 kernel 做了 shuffle，整块加载的前提不再成立，
+`vllm_moe_weight_sync.py` 需要跟着改）。
+
+```bash
+cat > "$RL_ROOT/moe_layout_probe.py" <<'PYEOF'
+"""Cross-check the transformers fused MoE expert layout against vLLM's."""
+import gc, os, torch
+
+MODEL = os.environ.get("PROBE_MODEL", f"{os.environ['DATA_ROOT']}/models/Qwen3-30B-A3B-Base")
+LAYERS = (0, 1, 23, 47)
+
+
+def vllm_side():
+    from vllm import LLM
+    llm = LLM(model=MODEL, tensor_parallel_size=1, dtype="bfloat16", enforce_eager=True,
+              gpu_memory_utilization=0.30, max_model_len=2048)
+
+    def extract(self):
+        m = self.model_runner.model
+        out = {}
+        for i in LAYERS:
+            e = m.model.layers[i].mlp.experts
+            out[f"{i}.w13"] = e.w13_weight.data.detach().cpu().clone()
+            out[f"{i}.w2"] = e.w2_weight.data.detach().cpu().clone()
+        out["_backend"] = str(getattr(e.quant_method, "unquantized_backend", None))
+        out["_contig"] = bool(e.w13_weight.data.is_contiguous())
+        return out
+
+    (r,) = llm.collective_rpc(extract)
+    del llm; gc.collect(); torch.cuda.empty_cache()
+    return r
+
+
+def hf_side():
+    from transformers import AutoModelForCausalLM
+    m = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.bfloat16, device_map="cpu")
+    out = {}
+    for i in LAYERS:
+        ex = m.model.layers[i].mlp.experts
+        out[f"{i}.gate_up"] = ex.gate_up_proj.data.detach().clone()
+        out[f"{i}.down"] = ex.down_proj.data.detach().clone()
+    del m; gc.collect()
+    return out
+
+
+if __name__ == "__main__":
+    v = vllm_side()
+    print("backend:", v["_backend"], "w13 contiguous:", v["_contig"])
+    h = hf_side()
+    ok = True
+    for i in LAYERS:
+        for tag, a, b in ((f"L{i} gate_up/w13", h[f"{i}.gate_up"], v[f"{i}.w13"]),
+                          (f"L{i} down/w2", h[f"{i}.down"], v[f"{i}.w2"])):
+            same = a.shape == b.shape and torch.equal(a, b)
+            ok &= same
+            print(f"  {tag:<22} {tuple(a.shape)} {'EXACT' if same else 'DIFFERS'}")
+    print("VERDICT:", "element-wise identical" if ok else "LAYOUTS DIFFER")
+    raise SystemExit(0 if ok else 1)
+PYEOF
+sudo docker exec "$CONTAINER" bash -lc '
+  cd "$RL_ROOT" && VLLM_ENABLE_V1_MULTIPROCESSING=0 VLLM_ROCM_USE_AITER=0 \
+  python3 moe_layout_probe.py'
+```
+> 期望 `backend: UnquantizedMoeBackend.TRITON`、8 行全 `EXACT`、`VERDICT: element-wise identical`。
+> 实测约 50 秒，占一张卡 + 约 60GB 主机内存；退出码 0 = 通过。
+> 临时绕过报错可用 `LUMENRL_WEIGHT_SYNC_CHECK=warn`，但那等于回到 bug 能藏 54 步的状态。
+
+**`filter_groups collected no valid groups`**
+基本都是用了 instruct/thinking 版模型而不是 Base 版，见 §13.1。
+
+**`from aiter import flash_attn_varlen_func` 版本不兼容 / 训练前向挂掉**
+`flydsl` 没升到 0.1.8，见 §13.1。
+
+**`Incompatible value 'None' for field of type 'str'`（`full_key: checkpointing.checkpoint_dir`）**
+用了 `checkpointing.checkpoint_dir=` 这种空值覆盖，见 §13.6。
+
+**`InterpolationResolutionError` / `SCRATCH_ROOT` 未定义**
+长跑配置引用 `${oc.env:SCRATCH_ROOT}`，`ENVX` 里必须带上它，见 §13.6。
+
+**`HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION` in `chunk_cat_cuda_kernel`**
+实测在长跑 step 128（21.5 小时）出现过一次，整个 Ray job 随 actor 一起死。
+**这不是 OOM**，别按显存不足去处理：
+
+- OOM 在这套栈上长这样：`torch.OutOfMemoryError: HIP out of memory. Tried to allocate ...` ——
+  分配阶段抛的 Python 异常。aperture violation 是 kernel **执行**阶段的硬件故障，
+  含义是"访问了不属于任何合法地址空间的地址"，即野指针，两回事
+- 崩之前显存很宽裕且平稳：`mem/actor_allocated_gb` 恒为 42.80、`max_reserved` 84.6–94.6GB
+  （252GiB 的卡，vLLM 另占 ~86GB），10 步内无上升趋势；日志里 0 条 OOM
+- `dmesg` 9 天 23738 行里 0 条 `oom-kill`；进程是 HSA runtime 在自己进程内抛的 SIGABRT
+  （带 Python traceback），不是内核 OOM killer 的 SIGKILL。主机还剩 2.4TB 内存，容器无内存上限
+- 0 条 amdgpu/kfd/RAS/ECC 内核消息，无 retired HBM page
+
+定位到的信息：faulting kernel 是 `chunk_cat_cuda_kernel<float, BFloat16>`，
+在 FSDP2 里**只有一个调用点** `foreach_reduce_scatter_copy_in` ——
+反向把 bf16 梯度打包进 fp32 的 reduce-scatter 缓冲区。`grid=[19472896, 8, 1]` 对得上：
+grid.y = 8 = world_size，19472896 × 4 elem/work-item = 77,891,584 ≈ 一个 MoE 层的每卡份额
+（623,120,640 / 8）。
+
+查过但**已排除**的假设：
+
+| 假设 | 结论 |
+|---|---|
+| 显存不足 / OOM | **排除**，见上面四条 |
+| fp32 缓冲区 2.32 GiB 超 2^31 字节导致 int32 溢出 | **排除**。`chunk_cat_repro.py` 用完全相同的形状跑并与切片参考实现逐位比对，128 专家（2.32 GiB）及以下全部 exact；kernel 用的是 64 位索引 |
+| 这块卡的 HBM 坏了 | **未发现**。GPU 3 做 220 GiB 写入回读 ×3 + 复现该形状 ×3 全部干净 |
+| kernel/形状本身有 bug | **不成立**。8 个 rank 每步跑同样形状的同一个 kernel，**只有 rank 3 死了**，其余 7 个正常 |
+
+剩下的可能是一次性野指针：`chunk_cat` 接收的是一个设备端指针数组（`BFloat16**`），
+某个梯度张量若在 kernel 执行前被释放/重分配，或更早的某个 kernel 越界写坏了内存，就是这个现象。
+ROCm 把 abort 归给队列读指针处的 packet，而当时有 ~88 个 packet 在飞（rptr 50676415 / wptr 50676503），
+所以真凶也可能是相邻的 kernel。单次事件无法进一步收敛。
+
+再遇到时的取证手段：`AMD_SERIALIZE_KERNEL=3` 串行化 kernel 以拿到准确归属（很慢，只在复现时开）；
+本次 GPU coredump 没抓到（日志里 `GPU coredump: execvp failed: No such file or directory`），
+要拿 dump 需要先把 handler 装好。
+
+**实践上更重要的是：存 checkpoint。**这次没存，128 步 21.5 小时全丢 ——
+这是 §13.6 关落盘那条路的真实代价。存了的话一次性崩溃只损失 10 步。
+
+**显存**：`mem/actor_max_reserved_gb` 实测 75–95GB（288GB 卡），vLLM 另占 ~86GB。要回退按 §12
+同样的办法降 `max_response_length` / `train_global_batch_size`。
+
+---
+
+## 14. FP8 底层 patch 清单（供排查，正常无需手动）
 
 - **训练侧**（Lumen `cfg.enable`，monkey-patch，`_apply_lumen_fp8`）：FP8 blockwise2d 线性 GEMM
   (`nn.Linear.forward`) + model-sensitive RMSNorm(模块替换) + **lm_head 反 patch 回 BF16**
@@ -846,7 +1238,7 @@ RMSNorm 未传 `use_model_sensitive_rmsnorm=1`,与训练侧 T5-like RMSNorm 不�
 
 ---
 
-## 14. verl 运行（复用同一环境：BF16 基线 + FP8 rollout）
+## 15. verl 运行（复用同一环境：BF16 基线 + FP8 rollout）
 
 > 本节让**同一台机器、同一个容器**在原生 LumenRL 之外，再跑通 **verl `recipe/dapo`**（DAPO 动态采样）的
 > 两条路线，**完全复用前面第 3–6 节**的容器 (`$CONTAINER`)、模型 (`Qwen3-8B-Base`) 与过滤后的数据
@@ -858,14 +1250,14 @@ RMSNorm 未传 `use_model_sensitive_rmsnorm=1`,与训练侧 T5-like RMSNorm 不�
 >   + vLLM async rollout `fp8_per_block` + AITER unified attention。
 >   **⚠️ 训练侧是 BF16 不是 FP8**：`LUMEN_ROLLOUT=ATOM` 让 `LumenConfig.enable()` 在
 >   `lumen/config.py:253-260` 提前 `return None, model`，FP8 量化（第 262 行之后）走不到。
->   要训练侧真 FP8 就删掉 `LUMEN_ROLLOUT=ATOM`，并用 §14.5 的指纹判据核实。
+>   要训练侧真 FP8 就删掉 `LUMEN_ROLLOUT=ATOM`，并用 §15.5 的指纹判据核实。
 >
 > 关键点：verl 与 Lumen/aiter 一样放在 `$RL_ROOT` 下（`$RL_ROOT/verl`），第 4 节 `-v "$RL_ROOT":"$RL_ROOT"`
 > 已把它挂进容器，因此**不用改容器**。`Lumen`(`amd-atom-rollout`)、`aiter`(`lumen/triton_kernels`) 已在第 3 节
 > clone，分支正好是 FP8 路线所需，直接复用；FP8 rollout 复用第 5 节的 vLLM AITER RMSNorm patch。
 > **已验证**：8×MI350X, Qwen3-8B-Base, 两条路线 smoke 各 1 步全过、exit 0、无 Traceback。
 
-### 14.1 追加拉取 verl（含 recipe 子模块 = DAPO 动态采样 trainer）
+### 15.1 追加拉取 verl（含 recipe 子模块 = DAPO 动态采样 trainer）
 
 | 仓库 | 分支/pin | 用途 |
 |---|---|---|
@@ -899,7 +1291,7 @@ test -f recipe/dapo/main_dapo.py && echo "recipe/dapo OK" || echo "MISSING recip
 > （FP8 E2E 必需：把 Lumen FP8 注入移进每个 Ray worker 的 `_build_model_optimizer`，并加 logits `.clone()`
 > 与 lm_head 保 BF16）。用 `git -C "$RL_ROOT/verl" log --oneline -1` 确认。
 
-### 14.2 在同一容器装 verl（不覆盖镜像内 vLLM/torch）
+### 15.2 在同一容器装 verl（不覆盖镜像内 vLLM/torch）
 
 ```bash
 sudo docker exec "$CONTAINER" bash -lc '
@@ -933,7 +1325,7 @@ PY
 > - `lumen.ops.quantize.ops` 若被**直接**首个导入会报“partially initialized … QuantizedLinearFunction”循环
 >   import；这是导入顺序假象。真实运行经 `lumen.quantize` 先进入即可，`verl_entry` 导入正常。
 
-### 14.3 BF16 smoke 脚本 `$RL_ROOT/run_smoke_dapo.sh`
+### 15.3 BF16 smoke 脚本 `$RL_ROOT/run_smoke_dapo.sh`
 
 ```bash
 cat > "$RL_ROOT/run_smoke_dapo.sh" <<'EOF'
@@ -991,7 +1383,7 @@ EOF
 chmod +x "$RL_ROOT/run_smoke_dapo.sh"
 ```
 
-### 14.4 FP8 rollout smoke 脚本 `$RL_ROOT/run_smoke_dapo_fp8.sh`（训练侧 BF16，见脚本内注释）
+### 15.4 FP8 rollout smoke 脚本 `$RL_ROOT/run_smoke_dapo_fp8.sh`（训练侧 BF16，见脚本内注释）
 
 相对 14.3：入口换成 `lumen.rl.verl.verl_entry`（委托 dapo），actor `fsdp2` + Lumen ATOM 对齐前向
 （**训练侧仍是 BF16**，`LUMEN_FP8=1` 被 `LUMEN_ROLLOUT=ATOM` 的提前 return 跳过），rollout
@@ -1022,7 +1414,7 @@ export VERL_EMPTY_CACHE_PER_MICRO_BATCH=1
 #    LUMEN_FP8=1 / LUMEN_FP8_SCALING=blockwise2d 对 actor 无效，只有
 #    norm/sdpa/linear/mlp 四个 ATOM 对齐 patch 生效（linear 是 BF16 TunedGemm）。
 #    本脚本的准确描述是「FP8 rollout（vLLM fp8_per_block）+ BF16 ATOM 对齐训练」。
-#    要训练侧真 FP8：删掉 LUMEN_ROLLOUT=ATOM（其余不动），并用 §14.5 的指纹判据核实。
+#    要训练侧真 FP8：删掉 LUMEN_ROLLOUT=ATOM（其余不动），并用 §15.5 的指纹判据核实。
 export LUMEN_VERL_MAIN=dapo LUMEN_FP8=1 LUMEN_ROLLOUT=ATOM LUMEN_FP8_FORMAT=fp8_e4m3 LUMEN_FP8_SCALING=blockwise2d LUMEN_FP8_BLOCK_SIZE=128
 export LUMEN_FP8_ATTN=mha LUMEN_FP8_QUANT_TYPE=blockwise LUMEN_ATTN_BACKEND=auto LUMEN_FORCE_FSDP=1
 export LUMEN_ACTOR_PATCH_NORM=1 LUMEN_ACTOR_PATCH_SDPA=1 LUMEN_ACTOR_PATCH_LINEAR=1 LUMEN_ACTOR_PATCH_MLP=1
@@ -1076,7 +1468,7 @@ EOF
 chmod +x "$RL_ROOT/run_smoke_dapo_fp8.sh"
 ```
 
-### 14.5 跑 Smoke（先各 1 step 验证整链路）
+### 15.5 跑 Smoke（先各 1 step 验证整链路）
 
 ```bash
 sudo docker restart "$CONTAINER"; sleep 6            # 清残留 ray 进程
@@ -1084,7 +1476,7 @@ sudo docker restart "$CONTAINER"; sleep 6            # 清残留 ray 进程
 sudo docker exec -e RL_ROOT="$RL_ROOT" -e DATA_ROOT="$DATA_ROOT" "$CONTAINER" \
   bash -lc "bash $RL_ROOT/run_smoke_dapo.sh" 2>&1 | tee $DATA_ROOT/logs/verl_smoke_bf16_$(date +%Y%m%d-%H%M%S).log
 
-# FP8 rollout smoke（训练侧 BF16；要真 FP8 见 §14.4 注释）
+# FP8 rollout smoke（训练侧 BF16；要真 FP8 见 §15.4 注释）
 sudo docker restart "$CONTAINER"; sleep 6
 sudo docker exec -e RL_ROOT="$RL_ROOT" -e DATA_ROOT="$DATA_ROOT" "$CONTAINER" \
   bash -lc "bash $RL_ROOT/run_smoke_dapo_fp8.sh" 2>&1 | tee $DATA_ROOT/logs/verl_smoke_fp8_$(date +%Y%m%d-%H%M%S).log
@@ -1092,8 +1484,8 @@ sudo docker exec -e RL_ROOT="$RL_ROOT" -e DATA_ROOT="$DATA_ROOT" "$CONTAINER" \
 
 期望证据（已验证：8×MI350X, Qwen3-8B-Base, 各 1 步, exit 0, 无 Traceback）：
 
-> 下表第三列是 §14.4 脚本的原样行为，即 **FP8 rollout + BF16 ATOM 对齐训练**（`LUMEN_ROLLOUT=ATOM`
-> 使 actor FP8 量化被跳过，见 §14.4 脚本内注释）。第四列是删掉 `LUMEN_ROLLOUT=ATOM` 后的
+> 下表第三列是 §15.4 脚本的原样行为，即 **FP8 rollout + BF16 ATOM 对齐训练**（`LUMEN_ROLLOUT=ATOM`
+> 使 actor FP8 量化被跳过，见 §15.4 脚本内注释）。第四列是删掉 `LUMEN_ROLLOUT=ATOM` 后的
 > **训练侧真 FP8**，2026-07-29 在 8×MI355X 实测。
 
 | 证据 | BF16 | ATOM 对齐（actor BF16） | 训练侧真 FP8 |
@@ -1131,7 +1523,7 @@ grep -a "a8w8_blockscale_tuned_gemm" "$LOG" | grep -c vLLMHttpServer    # 应为
 2026-07-29 实测真 FP8 长跑：前者 9426、后者 0；GEMM shape 为 `N:4096,K:12288`(down_proj)、
 `N:12288,K:4096`(gate/up)、`N:1024,K:4096`(k/v)，M 随动态批变化——即 Qwen3-8B 的真实训练层。
 
-### 14.6 长跑规模（相对 smoke 只放大规模/落盘）
+### 15.6 长跑规模（相对 smoke 只放大规模/落盘）
 
 把 14.3 / 14.4 复制为 `run_longrun_dapo.sh` / `run_longrun_dapo_fp8.sh`，按下面替换规模参数：
 `max_response_length=20480`、`train_batch_size=32`、`gen_batch_size=96`、`rollout.n=16`、`ppo_mini_batch_size=32`、
@@ -1165,12 +1557,12 @@ grep -aE "step:[0-9]+ -" "$LOG" | tail -1      # 最新 step 指标
 # 停止：sudo docker exec "$CONTAINER" bash -lc "pkill -9 -f 'main_[d]apo|verl_entry'; ray stop --force"
 ```
 
-### 14.7 verl vs LumenRL / BF16 vs FP8 一览
+### 15.7 verl vs LumenRL / BF16 vs FP8 一览
 
-> ⚠️ 第三列（§14.4 脚本原样）历史上被标为「FP8 E2E」，但**训练侧其实是 BF16**：
+> ⚠️ 第三列（§15.4 脚本原样）历史上被标为「FP8 E2E」，但**训练侧其实是 BF16**：
 > `LUMEN_ROLLOUT=ATOM` 让 `LumenConfig.enable()` 在 `lumen/config.py:253-260` 提前
-> `return None, model`，FP8 量化（第 262 行之后）走不到。要真 FP8 训练见 §14.4 注释与
-> §14.5 指纹判据。
+> `return None, model`，FP8 量化（第 262 行之后）走不到。要真 FP8 训练见 §15.4 注释与
+> §15.5 指纹判据。
 
 | 维度 | verl BF16 | verl ATOM 对齐（actor BF16） | LumenRL 原生（§1） |
 |---|---|---|---|
