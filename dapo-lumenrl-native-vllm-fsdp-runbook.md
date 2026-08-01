@@ -925,7 +925,7 @@ vLLM 的 Qwen3-MoE router 本来就是 BF16，两侧对齐比单侧提精度更�
 | 训练后端 | Megatron + Megatron-Bridge | FSDP2 | 这条线就是 FSDP2；verl 另有一个 FSDP 版但那是 FP8-rollout-only |
 | GPU | 2×8 H100 | 1×8 MI350X | 同样的 global batch，一半的卡，约 2 倍 step 时间 |
 | rollout 并行 | `gen_tp=2` | TP=1 每卡一个 colocated replica | 架构差异 |
-| `gpu_memory_utilization` | 0.5 | **0.4** | verl 生成时把参数/优化器 offload 到 CPU，LumenRL 的 Ray 路径不支持，训练显存常驻 |
+| `gpu_memory_utilization` | 0.5 | **0.30** | verl 生成时把参数/优化器 offload 到 CPU，LumenRL 的 Ray 路径不支持，训练显存常驻。**0.40 试过，撑不住**，见 §13.8 |
 | 验证采样 | temperature 0.6, top_p 1.0, n=1 | greedy | LumenRL val 是 greedy，仅诊断用，不影响训练 |
 
 **数据集不用另做**：verl 用 `max_prompt_length=2048`，而 §6.2 产出的缓存是按 1024 过滤的——
@@ -1047,31 +1047,38 @@ sudo docker exec -d "$CONTAINER" bash -lc "$ENVX \
 W&B（可选，`$RL_ROOT/wandb.key` 里放 `WANDB_API_KEY=xxxx`，脚本自动读）。MoE 长跑默认进
 `LUMEN-RL-MOE` 项目，换 run 名：`EXTRA_OVERRIDE='logger.wandb.name=<your-name>'`。
 
-### 13.7 健康判据
+### 13.7 健康判据（verlref 配置，8×MI350X 实测 101 步 / 21.6 小时）
 
-verl 对齐的长跑（`verlref_longrun`）**尚未跑完，本节还没有它的实测曲线**。
-下表是同一条代码路径上早先一版长跑的 127 步数据，配置不同（batch 512 = 32 prompt × 16、
-prompt 预算 1024、**R3 开 + fp32 router**、lr warmup 10 步），所以**绝对数值不能当成
-verlref 配置的期望值**——verlref 关掉了 R3 和 fp32 router，`rollout_corr/kl` 会高约 3 倍。
-可以当成期望值的是**趋势**和 step 时间量级。
+训练指标：
 
-| 指标（旧配置，仅供趋势参考） | step 1 | step 40 | step 80 | step 127 |
+| 指标 | step 1 | step 50 | step 101 | 与步数相关 |
 |---|---|---|---|---|
-| `rollout_corr/kl` | 0.000595 | 0.000255 | 0.000242 | 0.000192 |
-| `mismatch/abs_diff` | 0.0136 | 0.00504 | 0.00420 | 0.00308 |
-| `reward/accuracy` | 0.119 | 0.514 | 0.434 | 0.406 |
-| `entropy` | 0.998 | 0.152 | 0.104 | 0.0686 |
-| `grad_norm` | 0.187 | 0.165 | 0.126 | 0.0743 |
+| `reward/accuracy` | 0.136 | 0.494 | **0.581** | **+0.85** |
+| `rollout_corr/kl` | 0.00148 | 0.00052 | 0.00069 | −0.68 |
+| `mismatch/abs_diff` | 0.0213 | 0.0064 | 0.0077 | −0.75 |
+| `entropy` | 0.844 | 0.082 | 0.094 | −0.75 |
+| `grad_norm` | 0.197 | 0.056 | 0.031 | −0.56 |
 
-- **step 时间约 8–11 分钟**（resp=20480、batch 512，`gen_s` 占 500–600s），比 8B 的 4–5 分钟慢一倍。
-  verlref 的 batch 是它的 4 倍（2048 序列），单步会更长
-- `timing/weight_sync_s` 全程 1.1–1.2s，不随步数增长
-- step 120 的 AIME 验证 `val-core/acc/mean@1 = 0.226`
+AIME-2024 在线验证（每 10 步，greedy）：
+
+| step | 10 | 30 | 50 | 70 | 90 | 100 |
+|---|---|---|---|---|---|---|
+| `val-core/acc/mean@1` | 0.041 | 0.183 | 0.167 | 0.272 | **0.361** | 0.348 |
+| `val/response_length_mean` | 2407 | 4094 | 5792 | 5838 | 8331 | **10389** |
+
+**这就是这条线跑通的证据**：AIME 100 步从 4% 到约 35%，回答长度从 2.4k 涨到 10.4k
+（模型学会想更久），训练 accuracy 0.136 → 0.581。
+
+- **step 时间中位数约 11 分钟**（672s，resp=20480、batch 2048 序列）。前一版 batch 512 的配置是 8–11 分钟
+- `timing/weight_sync_s` 全程 1.1–1.4s，不随步数增长
 - **最关键的判据是 `rollout_corr/kl` 不随步数单调爬升。**它降下去是正常的（策略收敛变确定，
   log 空间分歧自然缩小）；**爬上去说明权重同步又漏了**，回到 §13.4 用 `VERIFY=1` 复查
-- **已知问题：熵坍缩。**entropy 127 步从 0.998 掉到 0.069，`reward/accuracy` 在 step 40 冲到 0.51
-  之后就在 0.41–0.59 横着不涨。verl 的 recipe 同样是 `entropy_coeff=0`，所以 verlref 大概率
-  会重现这个现象。这是在权重同步正确的前提下测到的，是**真实的策略坍缩**，不是同步 bug 的假象
+- **已知问题：熵坍缩。**entropy 101 步从 0.844 掉到 0.094。verl 的 recipe 就是 `entropy_coeff=0`，
+  所以这是照搬 recipe 的必然结果，不是我们移植出的偏差。前一版配置（R3 开、batch 512）也是同样形状：
+  127 步 0.998 → 0.069。这是在权重同步正确的前提下测到的，是**真实的策略坍缩**，不是同步 bug 的假象。
+  要治得先加 `entropy_coeff`，但那样就偏离 verl 的对照组了
+- **这一跑在 step 101 死于显存耗尽**（当时 `gpu_memory_utilization` 还是 0.40），见 §13.8。
+  上表的数据本身有效，但 101 步之后的行为还没有观测
 
 ### 13.8 MoE 专属排障
 
@@ -1161,8 +1168,7 @@ sudo docker exec "$CONTAINER" bash -lc '
 
 **`HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION` in `chunk_cat_cuda_kernel`**
 
-**已复现两次，是这条线目前最大的稳定性问题。**两次都在反向的 reduce-scatter copy-in，
-整个 Ray job 随出事的 actor 一起死：
+**复现过两次**，都在反向的 reduce-scatter copy-in，整个 Ray job 随出事的 actor 一起死：
 
 | | 第一次 | 第二次 |
 |---|---|---|
@@ -1227,21 +1233,45 @@ sudo docker exec "$CONTAINER" bash -lc 'cd "$RL_ROOT/Lumen-RL" &&
   python3 -m lumenrl.tests.test_fsdp_chunk_cat_fallback'   # 需要 1 张卡
 ```
 
-> ⚠️ **这是规避不是修复，而且有效性尚未确认。**开着 fallback 的长跑写这段时跑到 step 8，
-> 而上次崩在 step 11，**还没越过判据点**。默认关闭。
->
-> 这个开关同时是个**可证伪的实验**：跑过 step 11 还活着，说明故障确实在那个 kernel；
-> 照样崩，说明 ROCm 的归属误导了我们、真凶在别处 —— 那时再上 `AMD_SERIALIZE_KERNEL=3`
-> 串行化 kernel 拿准确归属（很慢，只在复现时开）。
-> 本次 GPU coredump 没抓到（`GPU coredump: execvp failed: No such file or directory`），
+**实测效果**（这个开关当初是作为可证伪的实验加的，结果如下）：
+
+| | 无 fallback | 有 fallback |
+|---|---|---|
+| 崩溃步数 | step 11 | step 101 |
+| 撑过的 copy-in 次数 | ~13.5 万 | **~124 万** |
+| 故障 | `APERTURE_VIOLATION` in `chunk_cat` | 换成了别的原因（见下） |
+
+**非法地址故障没有再出现**，在 9 倍的调用量下都没复现。这是支持 fallback 有效的证据，
+但原故障是概率性的，两三个数据点还不能算定论。**它仍然是规避而不是修复** ——
+为什么那个 kernel 会偶发访问非法地址，至今没有解释。
+
+> 如果开着 fallback 还是撞 `APERTURE_VIOLATION`，说明 ROCm 的归属误导了我们、真凶在别处，
+> 那时上 `AMD_SERIALIZE_KERNEL=3` 串行化 kernel 拿准确归属（很慢，只在复现时开）。
+> 目前 GPU coredump 抓不到（`GPU coredump: execvp failed: No such file or directory`），
 > 要拿 dump 得先把 handler 装好。
 
-**实践上更重要的是：存 checkpoint。**第一次崩掉 128 步 21.5 小时全丢 ——
-这是 §13.6 关落盘那条路的真实代价。存了的话一次性崩溃只损失 10 步。
+**`HSA_STATUS_ERROR_OUT_OF_RESOURCES ... Available Free mem : 0 MB`（这个是真 OOM）**
 
-**显存**：`mem/actor_max_reserved_gb` 在 `gpu_memory_utilization=0.4` 下实测 94–114GB
-（252GiB 的卡，vLLM 另占 ~101GB），余量约 37GB；0.3 时是 85–95GB、余量约 75GB。
-要回退按 §12 同样的办法降 `max_response_length` / `train_global_batch_size`。
+和上面那个非法地址故障**不是一回事**，别搞混。实测在 `gpu_memory_utilization=0.40` 下
+跑到 step 101（21.6 小时）出现，faulting kernel 是 `ncclDevKernel_Generic`：驱动侧没内存了，
+RCCL 分配不到通信资源。
+
+账是这么算的（252GiB 的卡）：
+
+| | 0.40 | 0.30 |
+|---|---|---|
+| vLLM | ~101GB | ~76GB |
+| actor `max_reserved` 峰值 | 117.6GB | 85–95GB |
+| **余量** | **~33GB** | **~59GB** |
+
+余量要留给 HSA runtime、RCCL 缓冲和驱动开销，33GB 不够。而且分配器水位会随步数爬
+（+0.086 GB/步，101 步涨了 8.7GB）——注意**这不是泄漏**：`mem/actor_allocated_gb` 恒为 42.8、
+`max_allocated` 恒为 75.6，存活内存完全不动，涨的是 caching allocator 的碎片。
+
+**所以 verlref 配置定在 `gpu_memory_utilization: 0.30`。**要往上调就得同时压 batch 或序列长度。
+
+**实践上更重要的是：存 checkpoint。**这三次崩溃分别丢了 128、11、101 步 ——
+第一次是 21.5 小时，第三次是 21.6 小时。这是 §13.6 关落盘那条路的真实代价。
 
 ---
 
