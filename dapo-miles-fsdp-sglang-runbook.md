@@ -710,9 +710,13 @@ W&B 面板在 `MilesRl` 项目。关键曲线：`train/grad_norm`、`train/train
 
 （step 9 之后插入了一次 12 分钟的 AIME eval，见 §11.4。）
 
+> 上表是 `--sglang-mem-fraction-static 0.70` 下的数字。改成 0.36 会让 `train_rollout_kl`
+> 变成 0.015–0.027，见 §13.3 —— 那不是"更对齐"，是坏了。
+
 - **`grad_norm` 0.66–1.47**，和 LumenRL 长跑的 ~0.85 基本重合。smoke 里偏高（1.5–2.1）
   是小 batch 下 seq-mean 与 token-mean 的差异被放大，512 序列下这个差异基本消失。
 - `train_rollout_kl` 全程 1.1–1.3e-3，**不随步数单调爬升**。爬上去说明权重同步漏了。
+  换过配置之后第一步就该落在这个区间；如果 step 0 就是 1e-2 量级，先回头看 §13.3。
 - 第 0 步 `truncated_ratio = 0.0`、平均回复 641 token —— 20480 的预算前期完全用不满，
   所以早期 step 只要 ~1 分钟。**回复长度会随训练增长，step 时间会明显变慢**，
   LumenRL 同规模长跑的稳态是 4–5 分钟/步。
@@ -756,6 +760,7 @@ docker exec "$CONTAINER" bash -lc '
 | `AssertionError: custom_tis_function_path must be set when get_mismatch_metrics is set` | `--get-mismatch-metrics` 只覆盖 MIS/RS 路径 | 去掉它；`--use-tis` 单独就会输出 `tis` / `tis_abs` / `tis_clipfrac` |
 | `unrecognized arguments: --save-retain-interval` | 抄了 `run_mcore_fsdp.py` 的 Megatron 专属参数 | FSDP parser 是 `parse_args()`，不吃 Megatron flag，删掉 |
 | `grad_norm` 4000+ | 开了 `--calculate-per-token-loss`（FSDP 上没归一化） | 去掉它，见 §13.2 |
+| `train_rollout_kl` 从 step 0 就是 1e-2 量级（正常是 1.2e-3） | 把 `--sglang-mem-fraction-static` 调低了（例如为了对齐 LumenRL 的 0.30 而设成 0.36） | 回到 0.70，见 §13.3。不是 KV 压力，也不是权重同步问题 |
 | `assert self.lr_warmup_steps < self.lr_decay_steps` | 步数少于 warmup 且没传 `--lr-decay-iters` | 显式传 `--lr-decay-iters`（constant 衰减下随便给个大数） |
 | reward 恒为 −1 / 动态采样一直凑不够组 | 用了 instruct/thinking 版模型，或 `--rm-type deepscaler`（它要求响应里有 `</think>`，base 模型不会产出） | 换 Base 版；用 `--rm-type dapo --reward-key score` |
 | `--rm-type dapo` 但 reward 是 dict 报错 | `compute_score` 返回 dict | 必须配 `--reward-key score` |
@@ -805,24 +810,89 @@ loss.backward()          # normalizer 被丢弃
 512 序列的长跑下两者数值上很接近（`grad_norm` 0.66–1.47 vs LumenRL ~0.85），
 128 序列的 smoke 下差一截（1.5–2.1 vs 0.75–0.99）。
 
-### 13.3 colocate 显存策略不同，吞吐不可直接比
+### 13.3 显存份额：**刻意不对齐**，改成 0.30 会让 mismatch 劣化 20 倍
 
-- LumenRL：训练 actor 和 vLLM 引擎**同时常驻**，`gpu_memory_utilization=0.30`，完全不 sleep，
-  权重经 CUDA-IPC 原地同步。
-- Miles：`--colocate` 隐含 `--offload-train` + `--offload-rollout`，每步要
-  sleep（2.6–8.6 s）+ wake（1.2–3.5 s）+ update_weights（3.6–13.0 s），合计 8–25 s 固定开销。
-  换来的是引擎能吃到 0.70 的显存份额。
+先说清楚对标对象。LumenRL 有两条 BF16 长跑线，选错会得出相反的结论：
 
-所以 `--sglang-mem-fraction-static 0.70` 和 `gpu_memory_utilization=0.30` **不是同一个语义**，
-不要以为改成 0.30 就"对齐"了。smoke 下 miles 每步 36.7–44.4 s vs LumenRL 16.8–22.5 s，
-差距主要来自这套 offload 开销，不是算子快慢。
+| | `MODE=bf16`（vLLM） | `MODE=atombf16`（ATOM） |
+|---|---|---|
+| CUDA graph | **关**（`enforce_eager: true`） | **开**（`run_dapo.sh` 覆盖 `enforce_eager=false` + `compilation_config.level=3`） |
+| sleep / offload | **关**（`enable_sleep_mode: false`，引擎常驻） | **开**（覆盖 `enable_sleep_mode=true`、`sleep_level=2`） |
+| 与 Miles 的可比性 | 差：两项都相反 | **好：两项都与 Miles 一致** |
 
-### 13.4 其它小差异
+Miles 的 colocate 是 CUDA graph 开 + sleep/offload 开，所以**跨框架对比要用 ATOM 那条线**
+（COMPARE-RL 里的 `lumen-rl-atom-fsdp-bf16`）。拿 vLLM 线做参考会把 CUDA graph 和 sleep
+误判成"未对齐项"。两条线的规模/超参完全相同，只有 rollout 引擎不同，所以 §8 的映射表两者通用。
+
+**显存份额没有对齐，这是刻意的。** LumenRL ATOM 是 `atom_cfg.gpu_memory_utilization: 0.30`；
+本 runbook 用 `--sglang-mem-fraction-static 0.70`。SGLang 在 `enable_memory_saver`（`--colocate`
+会打开）下把请求值乘 0.85，所以 0.70 落到 0.595，而 0.36 会落到 0.306 ≈ LumenRL 的 0.30。
+
+试过对齐，结论是**不能对齐**：
+
+| | `0.70`（→0.595） | `0.36`（→0.306） |
+|---|---|---|
+| `train_rollout_kl` | 0.0012 | **0.015–0.027** |
+| `tis_abs` | 0.019 | **0.052–0.067** |
+| `tis_clipfrac` | ~0 | **0.0026–0.0046** |
+| KV 池 | 1,132,707 token | 528,245 token |
+
+13–20 倍的训练/推理 mismatch 劣化，**从 step 0 就是常数偏移，不是漂移**。因果是双向验证过的：
+改下去劣化，改回来三项指标同时完全复原（0.00118 / 0.0190 / 0）。而且用一个同为 0.70、
+只换了 eval 集的 run 做过对照，确认 mem_fraction 是唯一变量。
+
+**不是 KV 压力**：零 preemption / retraction 事件，KV 池峰值只用到 13%。
+CUDA graph 配置（`max_bs=512`、`backend='full'`）、`chunked_prefill_size`、`max_prefill_tokens`、
+`max_running_requests`、prefix cache 命中率（0.48–0.78 vs 0.54–0.82）在两次之间**全部相同**。
+
+**机制未解释。** 在解释清楚之前保持 0.70 —— 20 倍的 mismatch 会淹没这个对比想测的任何东西，
+而且在当前回复长度下 KV 根本不是瓶颈，对齐这个参数换不来任何东西。
+
+### 13.4 每步生成量差 1.6 倍，且 Miles 的批次偏向短回复
+
+`n=16`、32 prompt、过采样 96 prompt —— 这些参数两边完全一致。但**每步实际跑完的生成量不一致**，
+因为两个框架实现 DAPO 动态采样的方式根本不同：
+
+| | LumenRL | Miles |
+|---|---|---|
+| 做法 | 把整个 96-prompt 的 gen_batch **跑到底**，再过滤，从幸存者里取 32 组 | 提交 96 组，**凑够 32 组通过过滤就 `abort()` 掉在飞请求** |
+| 每步跑完 | **恒定 96 组 / 1536 条**（日志里 `N=1536` 出现 207 次，一次没变） | **41–70 组 / 656–1120 条**（约 62%） |
+| 进入训练的 32 组 | 完整批次过滤后的子集 | **最先跑完的那 32 组** |
+
+代码在 `miles/rollout/sglang_rollout.py`：`while len(data) < target_data_size` 一退出就
+`aborted_samples = await abort(args, rollout_id)`。**现有参数改不了这个行为**，
+唯一的扩展点是 `--rollout-function-path`（要自己写函数）。
+
+**由此带来选择偏差。** 一个组要等它 16 个样本里最慢的那个结束才算完成，所以"先完成"≈"最长回复较短"。
+过滤器大约刷掉一半，凑够 32 个幸存者需要约 64 组完成，也就是**最慢的约 1/3 从来没进过训练** ——
+而那恰恰是最难的题、和模型往长度上限跑偏的那些。miles 又没有 overlong buffer（§13.1），
+等于对长回复既不惩罚也不训练，直接不看。
+
+**这个偏差目前没有量化。** `rollout/response_len/*` 只统计保留的 32 组
+（`RolloutFnTrainOutput(samples=data)`），全量生成的分布没有落日志；要量化得挂
+`--rollout-all-samples-process-path`。
+
+**也不要急着把它当成 reward 差距的原因。** 前 20 步 LumenRL 的 reward 从 −0.67 爬到 −0.46，
+miles 平在 −0.75 → −0.70，看着像，但至少有四个混淆项能独立解释：seq-mean vs token-mean（§13.2）、
+miles 没有 overlong buffer（§13.1）、两边数据洗牌顺序不同、20 步的 reward 噪声本来就大。
+反证也在：miles 的回复长度反而涨得更多（641→923 vs 716→789），真在往短里塌不该是这个走向。
+
+**不写代码能缓解的办法是 `--partial-rollout`**：被 abort 的组连同已生成部分回收进 buffer，
+下一轮接着生成，慢组最终还是会进训练，只是晚一步且带 off-policy 数据
+（`--mask-offpolicy-in-partial-rollout` 可以把这些 token 从 loss 里 mask 掉）。默认关。
+
+判据要看长跑后期：如果长度偏差真的起作用，miles 的 `response_len` 会先于 LumenRL 走平甚至回落，
+AIME 准确率也会更早饱和。LumenRL 参考线在 step 196 是 `response_length_mean=5020`、
+`val acc=0.228`。
+
+### 13.5 其它小差异
 
 | 项 | LumenRL | Miles | 影响 |
 |---|---|---|---|
-| rollout 引擎 | vLLM 0.23.0 | SGLang 0.5.17 | kernel/采样实现不同，`train_rollout_kl` 已验证同量级 |
+| rollout 引擎 | vLLM 0.23.0 / ATOM | SGLang 0.5.17 | kernel/采样实现不同，`train_rollout_kl` 已验证同量级 |
+| prefix caching | ATOM 线 `enable_prefix_caching: false` | SGLang radix cache **开**，命中率 0.48–0.82 | 16 个 generation 共享同一 prompt 前缀，对 prefill 成本影响不小；要对齐用 `--sglang-disable-radix-cache` |
 | 动态采样重试上限 | `max_num_gen_batches: 10`，超了抛异常 | 无上限，`while len(data) < target` 一直转 | 极端情况下 miles 会一直采样不报错 |
+| 权重同步分桶 | ATOM 线 `update_weights_bucket_megabytes: 2048` | `--update-weight-buffer-size` 512MB | 只影响 `perf/update_weights_time`，不影响 rollout |
 | 过滤判据 | acc 的组内 std | reward 的组内 std | reward = ±1 且由 acc 决定，等价（除非启用 overlong 惩罚） |
 | lr warmup 起点 | 第 1 步 = 2e-7 | 第 0 步 = 1e-7 | 差 1 步索引，第 10 步后都到 1e-6 |
 | 验证采样 | greedy，全量 960 | 同（本 runbook 设成 greedy n=1） | 见 §11.4 的去重建议 |
@@ -830,7 +900,47 @@ loss.backward()          # normalizer 被丢弃
 
 ---
 
-## 14. 一句话流程
+## 14. 与 LumenRL 的实测对比（COMPARE-RL）
+
+### 14.1 W&B 接线
+
+跨框架对比走 `xysheng/COMPARE-RL` 项目，group `dapo-8b-precision-comparison`。各框架先记到自己的
+项目，再由一个拷贝脚本搬进 COMPARE-RL，并把指标名映射到统一的 `compare/*` 命名空间。
+Miles 侧的映射（记录在拷贝 run 的 config 里）：
+
+| `compare/*` | Miles 源指标 | LumenRL 源指标 |
+|---|---|---|
+| `compare/kl` | `train/train_rollout_kl` | `core/kl` |
+| `compare/entropy` | `train/entropy_loss` | `core/entropy` |
+| `compare/reward_mean` | `rollout/raw_reward` | `core/reward_mean` |
+| `compare/step_time_s` | `perf/step_time` | `core/step_time_s` |
+| `compare/response_length_mean` | `rollout/response_len/mean` | `core/response_len_mean` |
+| `compare/val_core_acc_mean_at_1` | `eval/aime`（`(v+1)/2`） | `train/val-core/acc/mean@1` |
+
+> `rollout/raw_reward` 是 ±1 分的均值，准确率 = `(raw_reward + 1) / 2`。
+
+**必须按 step index 对齐比较**，不能比绝对墙钟：回复长度随训练增长，rollout 成本跟着涨，
+不同步数之间的耗时没有可比性。LumenRL 参考线 step 1 的平均回复是 716 token，step 196 是 5020。
+
+### 14.2 实测（vs `lumen-rl-atom-fsdp-bf16`，同为 8×MI355X）
+
+| step | resp_len（Lumen / Miles） | step_s（Lumen / Miles） | kl（Lumen / Miles） |
+|---|---|---|---|
+| 1 | 716 / 641 | 131.8 / 98.7 | 0.00090 / 0.00120 |
+| 3 | 778 / 601 | 206.7 / 57.3 | 0.00092 / 0.00125 |
+| 10 | 729 / 800 | 168.0 / 58.8 | 0.00104 / 0.00119 |
+| 20 | 789 / 923 | 196.1 / 62.0 | 0.00069 / 0.00110 |
+
+- **回复长度相当的前提下，Miles 每步快 2.5–3 倍。** 主因不是算子快慢，而是 §13.4 的生成量差异：
+  LumenRL 每步跑完 1536 条，Miles 只跑完 656–1120 条。其次是 prefix caching（§13.5）。
+- `kl` 两边同量级，Miles 略高约 20%。这是判断"对比是否成立"的关键指标 —— 它对得上，
+  才说明两边的训练/推理一致性处在同一水平。
+- `entropy` 20 步内 LumenRL 0.63→0.41、Miles 0.73→0.63；`reward` LumenRL −0.67→−0.46、
+  Miles −0.75→−0.70。**这个差距目前无法归因**，混淆项见 §13.4 末尾。
+
+---
+
+## 15. 一句话流程
 
 ```bash
 # 1. 选镜像（别用 rlsys/miles:*-latest）
