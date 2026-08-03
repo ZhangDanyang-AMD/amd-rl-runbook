@@ -18,6 +18,10 @@
 >
 > **MoE 见 §13**:同一套环境换成 Qwen3-30B-A3B-Base（BF16 FSDP2 + vLLM），第 2–5 节环境完全复用，
 > 只需补装 `flydsl==0.1.8` 并下模型。第 13 节自带 smoke、长跑、健康判据和专属排障。
+>
+> **Megatron-Native + EP=8 见 §13.9–13.15**:同一个 MoE 配方、同一份数据、同一个 rollout，
+> 只把训练后端换掉（`training_backend: megatron_native`，TP=PP=CP=1 · EP=8 → DP=8，和 FSDP2 的
+> DP8 对齐）。额外要装 megatron-core / Apex / TransformerEngine，见 §13.10。
 
 ---
 
@@ -828,8 +832,12 @@ RMSNorm 未传 `use_model_sensitive_rmsnorm=1`,与训练侧 T5-like RMSNorm 不�
 规模/超参**不再照抄 §7 的 8B 表格**，而是对齐 verl 的 FP8 参考实验
 （`recipe/low_precision/run_dapo_qwen3_moe_30b_megatron_fp8e2e.sh`）的 BF16 基线，见 §13.3。
 
-> 这条线**不是** Megatron+EP。Megatron 那条见 `dapo-lumenrl-megatron-moe-ep-handoff.md`，别混。
-> 调试历史与已排除的假设见 `dapo-lumenrl-moe-fsdp-vllm-handoff.md`。
+> §13.1–13.8 这条线**不是** Megatron+EP。同一个模型换 Megatron-Native 后端见
+> **§13.9–13.15**（两条线的 config 除了 `training_backend` 和 `megatron_cfg` 逐字段相同，
+> 所以可以直接对照）；MoE+EP 的实现说明见 `dapo-lumenrl-megatron-moe-ep-handoff.md`，
+> 环境从零构建见 `dapo-lumenrl-vllm-fsdp-megatron-new-machine-runbook.md`。
+> 调试历史与已排除的假设见 `dapo-lumenrl-moe-fsdp-vllm-handoff.md`
+> 和 `megatron-moe-length-collapse-handoff.md`。
 
 ### 13.1 相对 8B 路线的差异（只有这些）
 
@@ -1272,6 +1280,447 @@ RCCL 分配不到通信资源。
 
 **实践上更重要的是：存 checkpoint。**这三次崩溃分别丢了 128、11、101 步 ——
 第一次是 21.5 小时，第三次是 21.6 小时。这是 §13.6 关落盘那条路的真实代价。
+
+### 13.9 换成 Megatron-Native 后端（EP=8，同一配方）
+
+同一个 MoE policy、同一份数据、同一个 colocated vLLM rollout，只把训练后端从 FSDP2 换成
+Megatron-Native + Expert Parallel。**这一节存在的意义是"只有一个变量"**：两个 config 除了
+`policy.training_backend` 和 `megatron_cfg` 之外逐字段相同，所以两条线的任何差异都只能来自训练后端。
+
+| | §13.1–13.8（FSDP2） | 本节（Megatron-Native） |
+|---|---|---|
+| `policy.training_backend` | `fsdp2`（默认） | `megatron_native` |
+| 并行 | FSDP2 全分片，DP=8 | **TP=1, PP=1, CP=1, EP=8 → DP=8** |
+| 专家 | 融合 3D 张量（transformers 5.x 布局） | Megatron `TopKRouter` + grouped-GEMM，128 专家 / 8 卡 = 每卡 16 个 |
+| 优化器 | fp32 master + bf16 compute | Megatron distributed optimizer（fp32 master 分片到 DP） |
+| 额外依赖 | 无 | **megatron-core 0.18.2 + ROCm Apex + ROCm TransformerEngine**（§13.10） |
+| checkpoint | FSDP2 分片，约 342GB | Megatron dist-checkpoint，**约 400GB** |
+| step 时间（resp=20480, batch 2048） | 约 11 分钟 | **约 9.3 分钟**（首步约 14 分钟，含 vLLM 加载） |
+
+**拓扑为什么选 EP=8 而不是 TP/PP 混合**：`DP = 8 / (TP × PP × CP) = 8`，和 FSDP2 的 DP8 一致，
+每个 rank 仍然看到 2048/8 = 256 条序列，梯度是同一个全局 batch 在同一种切分下的平均。
+任何缩小 DP 的改动都会让 distributed optimizer 的 state 每卡翻倍（DP 8→4 多约 8.5GB），
+把激活上省下来的又吃回去 —— **CP=2 实测当场 OOM**，比 CP=1 更早死。TP、PP 同理，
+它们不是这条线上的显存解法。
+
+> **两个后端不能共用 checkpoint 目录**（格式不同），也**不能同时占卡**。起之前确认无残留进程、
+> 显存回到空闲基线（每卡约 298MB）。
+
+### 13.10 额外环境：megatron-core / Apex / TransformerEngine
+
+§2–§5 的环境是 FSDP2 用的，Megatron 还需要三样东西。**完整的从零构建步骤见
+`dapo-lumenrl-vllm-fsdp-megatron-new-machine-runbook.md` §6**（含逐步验证、编译期坑和 manifest），
+这里只给已验证的 revision 和最短路径：
+
+| 组件 | 版本 / revision | 装法 |
+|---|---|---|
+| megatron-core | `0.18.2` | `pip install --no-deps "megatron-core==0.18.2"` |
+| ROCm Apex | `daed85255d51476425080e7e6203f0bee6d7e4cc` | 源码 `setup.py install --cpp_ext --cuda_ext`，`PYTORCH_ROCM_ARCH=gfx950` |
+| ROCm TransformerEngine | `6e541a10419a6e31bdc98b1516db04eb81a463b6` → `2.15.0.dev0+6e541a1` | 源码 `pip install -v . --no-build-isolation`，约 9 分钟 |
+
+```bash
+# megatron-core：不要装 megatron-bridge，Qwen3 HF<->Megatron 转换由 LumenRL
+# lumenrl/engine/training/qwen3_megatron_bridge.py 负责。
+sudo docker exec "$CONTAINER" bash -lc 'pip install --no-deps "megatron-core==0.18.2"'
+```
+
+TE 编译要点（细节见那份 runbook §6.3）：必须用 **ROCm fork**、必须递归拉全部 submodule
+（约 5.1GiB，含 AOTriton / CK JIT / Composable Kernel），编译前先卸掉可能存在的 NVIDIA TE 包，
+并且要带 `TORCH_DONT_CHECK_COMPILER_ABI=1` —— ROCm 7.2.3 的 `hipcc -v` 在没有输入文件时返回 1，
+CK-JIT 的编译器 ABI 探测会把它误判成"编译器不可用"。
+
+> ⚠️ **绝对不要 `pip install transformer_engine`**，那会装成 NVIDIA 版，导入即 undefined symbol。
+
+一站式验证（TE / Apex / megatron-core / 双 engine 注册）：
+
+```bash
+sudo docker exec "$CONTAINER" bash -lc 'cd "$RL_ROOT" && python3 megatron_verify.py'
+```
+> 期望看到 `megatron.core 0.18.2`、`transformer_engine 2.15.0.dev0+6e541a1`、Apex
+> `FusedLayerNorm/FusedAdam OK`，以及 `fsdp2` 和 `megatron_native` 两个 engine 都注册成功。
+> 这个脚本在 `$RL_ROOT/`，是那份 runbook 生成的产物。
+
+**flydsl 有个坑值得单独记**：`run_dapo.sh` 把本地 `$AITER_DIR` 放在 `PYTHONPATH` 最前，
+运行时用的是**仓库里的 aiter 源码**，它要求 flydsl ≥ `0.1.5.dev515`，所以必须是 §13.1 那个
+`flydsl==0.1.8`。而镜像自带的 wheel `amd-aiter 0.1.13.post1` 反过来 pin `flydsl<0.1.5`，
+升级后它会报 `cannot import name 'fly_values'`。两者互斥，**只有走 `run_dapo.sh` 的 PYTHONPATH
+才是对的**，别按 wheel 的 pin 回退。
+
+### 13.11 config、拓扑与 router 精度
+
+两个 config，都是 §13.3 那两个 FSDP2 verlref 文件的逐字段拷贝：
+
+| 用途 | config | 规模 |
+|---|---|---|
+| **4k smoke** | `dapo_qwen3moe_a3b_ray_megatron_verlref_4k_smoke.yaml` | prompt=2048, resp=4096, 8 prompt × 16, gen_batch=24, 3 步 |
+| **长跑** | `dapo_qwen3moe_a3b_ray_megatron_verlref_longrun.yaml` | prompt=2048, resp=**20480**, **128 prompt × 16 = 2048 序列**, gen_batch=384, 1000 步 |
+
+`megatron_cfg` 的全部内容（长跑）：
+
+```yaml
+      use_distributed_optimizer: true
+      tensor_model_parallel_size: 1
+      pipeline_model_parallel_size: 1
+      context_parallel_size: 1
+      expert_model_parallel_size: 8       # 128 专家分到 8 卡
+      sequence_parallel: false
+      moe_grouped_gemm: true
+      moe_permute_fusion: true            # 融合 MoE permute，少一批 scratch buffer
+      moe_aux_loss_coeff: 0.0             # RL loss 不变，和 FSDP2 一致
+      moe_router_dtype: fp32              # 见下方"router 精度"
+      recompute_granularity: full         # resp=20480 必需
+      recompute_method: uniform
+      recompute_num_layers: 1
+      log_probs_chunk_size: 1024
+      enable_dynamic_batch: true
+      max_tokens_per_gpu: 8192            # 不是 22528，见下方"显存"
+```
+
+相对 §13.3 那个 FSDP2 长跑，**只有三处偏离，都只影响显存/吞吐，不改变优化问题**：
+
+| 项 | FSDP2 | Megatron | 原因 |
+|---|---|---|---|
+| `gpu_memory_utilization` | 0.30 | **0.25** | Megatron-Native 每 actor 常驻显存比 FSDP2 高约 68%（4k smoke 实测 72.0 vs 42.8 GB allocated、137 vs 114 GB 峰值 reserved）。0.25 已接近地板：每个 colocated replica 要装整个 30.5B BF16 权重（约 61GB），0.25×288GB 只剩约 11GB 给 KV cache，再低就起不来 |
+| `max_tokens_per_gpu` | —（FSDP2 用 `max_token_len_per_gpu`） | **8192**，不是 22528 | **这不降低最坏 bin** —— `_build_bins` 会给任何超过预算的行单独一个 bin，每步那条约 20.7k token 的序列照样独占一个。但它能阻止**每个打包 bin** 也都涨到 22.5k：从每步约 7 次峰值级的 allocate/free 变成 1 次。见下方"显存" |
+| `recompute_granularity` | 未开 | `full` | 把 resp=20480 的激活峰值压住 |
+
+**router 精度：这里是 fp32，和 §13.3 的 FSDP2 刻意不同。**
+FSDP2 那条线用 BF16 是对的 —— FSDP2 和 vLLM 跑的是**同一个 PyTorch router op、同一种布局**，
+BF16 舍入会让两边落到同一组 top-8 专家。但 Megatron 走的是它自己的 `TopKRouter` 喂 grouped-GEMM，
+BF16 下两种实现会在"近乎平票"的 token 上选出不同专家，而翻一个专家会让那个 token 的 log-prob 变很多。
+实测：`moe_router_dtype: null` 时 `rollout_corr/kl` 到 step 77 一直平在 6.5e-4，然后每步约 +16%
+爬到 step 110 的 2.4e-2，而同期 FSDP2 稳在 6.6e-4；换成 fp32 之后到 step 185 都还是 7e-4。
+
+所以**长跑必须带 `LUMENRL_FP32_MOE_ROUTER=1`**，smoke（`moe_router_dtype: null`）必须带 `=0`。
+这个环境变量只作用于 **vLLM worker**（Megatron engine 读的是 `megatron_cfg.moe_router_dtype`），
+**两处必须一起翻**，否则变成反向不匹配。日志里对应
+`MoE+EP spec: ... EP=8 ... router_dtype=fp32 pre_softmax=False aux_loss_coeff=0.0`。
+
+> `pre_softmax=False` 是对的：HF 的 `norm_topk_prob=True` 和 Megatron 的 `pre_softmax=False`
+> 在"选哪些专家"和"权重是多少"上严格等价。`score_function` / `topk_scaling_factor` 两边都没设。
+
+**R3（Rollout Routing Replay）默认关**，和 §13.3 同理（verl 这个 recipe 没有它）。
+
+### 13.12 必须带上的代码修复（拉到最新就有）
+
+这条线上有三个已修的 bug，全部在 `dev/vllm-fsdp-dapo`。**`git pull` 到最新即可，不需要手动改任何东西**，
+但值得知道它们是什么，因为前两个会静默地改变训练结果：
+
+| commit | 修的东西 |
+|---|---|
+| `2bbdfde` | **`_row_policy_loss` 里 `response_mask` 对齐差一位**（Megatron 独有） |
+| `a09b702` | Ray 路径从未真正应用 rollout IS 权重（两个后端都中） |
+| `f3d20e2` | `rollout_corr/kl` 背后三个 per-token 张量的落盘探针（诊断用，默认关） |
+| `c9d75ca` | 本节这两个 config |
+
+**`2bbdfde` 是这条线上最重要的一个，说明一下为什么。**
+`rl_trainer._build_response_mask` 返回的是 `mask[:, 1:]` —— 宽度 `S-1`、第 i 项标记 token i+1，
+和 `old_log_probs`、训练侧 `token_lp` 是同一个坐标系。`megatron_base_engine._row_policy_loss` 里
+原来写的是 `_col("response_mask", shift=True)`，**又 shift 了一次**，整个 loss 窗口往前滑一格：
+
+| | 应该覆盖 | 实际覆盖 |
+|---|---|---|
+| `token_lp` 下标 | `plen-1 .. L-2` | `plen-2 .. L-3` |
+| 含义 | 首个 response token 的预测 … **EOS 的预测** | 最后一个 **prompt** token 的预测 … EOS 前一个 |
+
+后果是**每条序列的 EOS 位置拿不到任何策略梯度**，而 EOS 恰好是决定响应长度的那个 token；
+同时最后一个 prompt 位置被算进了 loss（这一半危害小：GRPO 组内 advantage 和为 0、同组 prompt 完全相同、
+单步单 epoch 下 ratio 恒为 1，这项梯度精确抵消）。
+
+FSDP2 那条路径（`actor_worker._policy_loss_fn`）用的是宽度判断
+`if mask.shape[-1] == L + 1: mask = mask[:, 1:]`，不会重复 shift，**所以只有 Megatron 错**。
+这是两个后端在 loss 层面唯一的行为差异，也就是"同一配方、FSDP2 正常而 Megatron 长度崩塌"的头号嫌疑。
+
+它还顺带解释了一个当时看不懂的现象：窗口前移后被纳入 loss 的那个 prompt 位置，rollout 引擎从来没为它
+上报过 logprob，于是 `rollout_lp` 在那里精确为 `0.0` —— **每条序列恰好一个**，2048 条序列就是
+2048 个坏 token，它们贡献了 `rollout_corr/kl` 的 **97.4%**（那些位置上 `old_lp` 均值 −52.3，
+`log p = 0` 意味着概率 1.0）。剔掉它们之后 `mean(rollout − train)` 从 +0.0318 掉到 +0.00082，
+和 FSDP2 同期的 +0.00066 是同一量级。**换句话说，修之前那条 kl 曲线本身不可信。**
+
+不占 GPU 的对齐自检。它重建 trainer 交给引擎的那套张量坐标系，再回放 `_row_policy_loss` 的切片，
+断言选中的位置正好是 response token 集合（含 EOS）、且每个位置都有真实的 rollout logprob：
+
+```bash
+cat > "$RL_ROOT/test_response_mask_alignment.py" <<'PYEOF'
+"""Check that the Megatron per-row loss masks exactly the response tokens."""
+import os, sys
+import torch
+
+_ROOT = os.environ.get("RL_ROOT") or os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(_ROOT, "Lumen-RL"))
+from lumenrl.trainer.rl_trainer import RLTrainer
+
+# Set to 1 to replay the pre-2bbdfde behaviour (unconditional shift).
+BUGGY = os.environ.get("REPLAY_BUG") == "1"
+
+
+def build_batch(prompt_lens, resp_lens, pad_id=0):
+    """Left-padded sequences plus the tensors the Ray controller derives."""
+    lens = [p + r for p, r in zip(prompt_lens, resp_lens)]
+    S, B = max(lens), len(lens)
+    ids = torch.full((B, S), pad_id, dtype=torch.long)
+    am = torch.zeros((B, S), dtype=torch.long)
+    for i, L in enumerate(lens):
+        ids[i, S - L:] = torch.arange(1, L + 1)
+        am[i, S - L:] = 1
+    # engine_compute_log_probs writes lp[r, start : start+L-1]; entry i scores token i+1
+    old_lp = torch.zeros((B, S), dtype=torch.float32)
+    rollout_lp = torch.zeros((B, S - 1), dtype=torch.float32)
+    for i, L in enumerate(lens):
+        off = S - L
+        old_lp[i, off:off + L - 1] = -1.0
+        rs = off + prompt_lens[i] - 1          # one log-prob per generated token
+        rollout_lp[i, rs:rs + resp_lens[i]] = -2.0
+    return {
+        "input_ids": ids, "attention_mask": am,
+        "old_log_probs": old_lp, "rollout_log_probs": rollout_lp,
+        "response_mask": RLTrainer._build_response_mask(None, ids, am, prompt_lens),
+        "advantages": torch.ones(B, dtype=torch.float32),
+    }
+
+
+def replay_row(t, r):
+    """The slicing MegatronBaseEngine._row_policy_loss performs for one row."""
+    idx = t["attention_mask"][r].nonzero(as_tuple=False).squeeze(-1)
+    start, L = int(idx[0]), int(idx.numel())
+    token_lp = torch.zeros(1, L - 1)           # scores tokens start+1 .. start+L-1
+
+    def col(name, shift):
+        return t[name][r][start + (1 if shift else 0):].reshape(1, -1)
+
+    rm = t["response_mask"]
+    shift = True if BUGGY else rm.shape[-1] >= t["input_ids"].shape[-1]
+    mask, old_lp, rlp = col("response_mask", shift), col("old_log_probs", False), \
+        col("rollout_log_probs", False)
+    Le = min(v.shape[-1] for v in (token_lp, old_lp, mask, rlp))
+    return start, L, mask[0, :Le], rlp[0, :Le]
+
+
+def main():
+    prompt_lens, resp_lens = [7, 5, 9], [6, 11, 4]
+    t = build_batch(prompt_lens, resp_lens)
+    failures = 0
+    for r, (plen, rlen) in enumerate(zip(prompt_lens, resp_lens)):
+        start, L, mask, rlp = replay_row(t, r)
+        # token_lp index j scores token start+1+j, so response tokens
+        # start+plen .. start+L-1 are indices plen-1 .. L-2
+        want = torch.zeros(mask.shape[-1])
+        want[plen - 1:L - 1] = 1.0
+        sel = mask.nonzero(as_tuple=True)[0].tolist()
+        zeros_in_mask = int(((rlp == 0.0) & (mask > 0)).sum())
+        ok = torch.equal(mask, want) and zeros_in_mask == 0 and len(sel) == rlen
+        print(f"row {r}: prompt={plen} resp={rlen} start={start} L={L} selected={sel} "
+              f"n={len(sel)} (want {rlen}) mask_ok={torch.equal(mask, want)} "
+              f"rollout_lp_zero_in_mask={zeros_in_mask}")
+        failures += not ok
+    print("FAIL" if failures else "PASS")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+PYEOF
+
+sudo docker exec "$CONTAINER" bash -lc 'cd "$RL_ROOT" && python3 test_response_mask_alignment.py'
+```
+> 期望 `PASS`，每行 `n=<resp_len> (want <resp_len>) mask_ok=True rollout_lp_zero_in_mask=0`。
+> 加 `REPLAY_BUG=1` 可以看到修复前的行为：窗口整体前移一格（`selected=[5..10]` 而不是 `[6..11]`）、
+> 丢掉 EOS 位置，并且 `rollout_lp_zero_in_mask=1` —— **每行恰好一个**，这就是那 2048 个坏 token 的来源。
+
+**`a09b702`（TIS 接线）**：`compute_rollout_is_weights` 原来只在 `rl_trainer.train()` 里被调用，
+而 Ray 控制器在 `train()` 开头就分流去 `_train_with_ray_controller()` 了，所以
+`rollout_is_weights` 从未写进 batch，引擎查不到、`asymmetric_clip_loss` 什么修正都没做。
+config 里 verl 对齐的 `rollout_is: token` / `rollout_is_threshold: 2.0` **是空转的，两个后端都一样**。
+现在两条路径共用 `_apply_rollout_is_weights()`，并且多报四个 `rollout_correction/*` 指标。
+
+⚠️ 这**同时改变了 FSDP2 基线的行为**（§13.7 那组数是 TIS 空转时测的）。4k 实测影响很小
+（`is_weight_mean=0.9997`、`is_weight_max=2` 打到 clip 上限），但要和 §13.7 严格对齐做 A/B 时，
+把 config 里 `quantization.rollout_correction.rollout_is` 置空即可关掉。
+
+### 13.13 Smoke 与长跑
+
+**Smoke（4k，3 步）。**注意 `LUMENRL_FP32_MOE_ROUTER=0` —— smoke config 的
+`moe_router_dtype` 是 `null`，两处必须一致：
+
+```bash
+S=$RL_ROOT/Lumen-RL/examples/DAPO/run_dapo.sh
+ENVX="export RL_ROOT='$RL_ROOT' DATA_ROOT='$DATA_ROOT' SCRATCH_ROOT='$DATA_ROOT' \
+PYTORCH_CUDA_ALLOC_CONF=;"
+
+sudo docker exec "$CONTAINER" bash -lc "$ENVX LUMENRL_FP32_MOE_ROUTER=0 \
+  CONFIG_OVERRIDE=examples/DAPO/configs/dapo_qwen3moe_a3b_ray_megatron_verlref_4k_smoke.yaml \
+  MODEL_PATH=\$DATA_ROOT/models/Qwen3-30B-A3B-Base STEPS=3 MODE=bf16 \
+  LOG=\$DATA_ROOT/logs/moe-a3b-4k-smoke-megatron.log bash '$S'; \
+  tail -40 \"\$(cat /tmp/run_dapo_log.txt)\""
+```
+
+实测（8×MI355X，修复后，3 步约 11 分钟，其中约 6 分钟是加载）：
+
+| step | 1 | 2 | 3 |
+|---|---|---|---|
+| `rollout_corr/kl` | 0.00184 | 0.00180 | 0.00163 |
+| `rollout_correction/kl` | 0.00173 | 0.00164 | 0.00176 |
+| `rollout_correction/is_weight_mean` | 0.9997 | 1.00002 | 0.9999 |
+| `ppo_kl` | 1.07e-4 | 1.59e-4 | −1.26e-4 |
+| `seq/mean_response_len` | 871 | 714 | 971 |
+| `timing/step_s` | 111 | 93 | 103 |
+| `mem/actor_max_reserved_gb` | 128 | 139 | 140 |
+
+Smoke 期望证据：
+- `MoE+EP spec: num_experts=128 topk=8 moe_ffn=768 | tp=1 pp=1 cp=1 EP=8 etp=1 -> local_experts/rank=16 | grouped_gemm=True router_dtype=fp32 pre_softmax=False aux_loss_coeff=0.0`
+  （smoke 用 `null` 时这里是 `router_dtype=None`）
+- **`rollout_correction/*` 这一族指标必须出现** —— 它们在就说明 `a09b702` 的 TIS 真的接上了；没有就是代码没拉到最新
+- `rollout_corr/kl` 在 **1.5e-3 量级**且不随步数爬升
+- 无 `Traceback` / `HSA_STATUS`
+
+**长跑（resp=20480）。先看磁盘**：Megatron dist-checkpoint 约 **400GB**，
+`CheckpointCallback` 会先删旧的再写新的（commit `1e01aef`），稳态一份，但仍需 400GB 可用。
+长跑 config 的 `save_steps: 5` 很激进（9.3 min/步 → 约 46 分钟一次 400GB 落盘），
+按容错需求调大：`EXTRA_OVERRIDE='checkpointing.save_steps=20'`。
+
+```bash
+df -h "$DATA_ROOT"     # 至少 400G
+
+S=$RL_ROOT/Lumen-RL/examples/DAPO/run_dapo.sh
+# 注意是 =1，和 config 的 moe_router_dtype: fp32 配对
+ENVX="export RL_ROOT='$RL_ROOT' DATA_ROOT='$DATA_ROOT' SCRATCH_ROOT='$DATA_ROOT' \
+LUMENRL_FP32_MOE_ROUTER=1 PYTORCH_CUDA_ALLOC_CONF=;"
+
+sudo docker exec -d "$CONTAINER" bash -lc "$ENVX \
+  CONFIG_OVERRIDE=examples/DAPO/configs/dapo_qwen3moe_a3b_ray_megatron_verlref_longrun.yaml \
+  MODEL_PATH=\$DATA_ROOT/models/Qwen3-30B-A3B-Base STEPS=1000 MODE=bf16 \
+  LOG=\$DATA_ROOT/logs/longrun-moe-a3b-megatron.log bash '$S'"
+```
+> `PYTORCH_CUDA_ALLOC_CONF=` 置空是刻意的（§8）：本平台的 ROCm 没有 `expandable_segments`。
+> `SCRATCH_ROOT` 必须给，config 的 `checkpoint_dir` 引用了它，omegaconf 解析不到直接退出。
+> config 里 `resume: true`，新机器目录为空时就是从 step 0 开始；**checkpoint 目录和 FSDP2 那条线必须分开**。
+
+启动后先确认三件事，再放手：`MoE+EP spec ... EP=8 ... router_dtype=fp32`、
+无 `Traceback` / `HSA_STATUS`、首步在约 14 分钟内出 `callbacks: step=1`。
+监控 / 停止 / 续跑照 §11，停止时记得连 Ray actor 一起清：
+
+```bash
+sudo docker exec "$CONTAINER" bash -lc \
+  'ray stop --force; pkill -9 -f "[l]umenrl.trainer.main"; pkill -9 -f "[V]LLMRayServer"; \
+   pkill -9 -f "[E]ngineCore"; sleep 10'
+```
+
+### 13.14 健康判据与当前已知状态
+
+**先说清楚状态**：`2bbdfde` 修完之后，**resp=20480 的长跑还没有跑过完整的观测窗口**。
+下面把"修之前测到什么"和"修之后测到什么"分开列，别把两组数混着用。
+
+**修之前（有 EOS 对齐 bug）：长度会崩，可复现、跨配置、跨拓扑。**
+
+| run | 配置 | 形状 |
+|---|---|---|
+| `lepges5o` | EP=8, batch 2048, resp 20480 | step 1–100 健康（acc 0.295→0.516、resp_len 844→2150），step 101–120 `seq/max_len` 掉到 11074、`resp_len` 回落到 1884、acc 0.503 |
+| `p819dsox` | TP2·PP2·CP2·EP2·ETP2, batch 512, fp32 router | step 1–140 健康（acc 0.15→0.54、长度增长），step 142 起 `max_len` 单调收缩 18099→10014→5629→3723→1896，acc 掉到 0.28 |
+| 同期 FSDP2 `z8aeo3cf` | 同配方 | step 101–120 `resp_len` 3204 →（121–140）4253，**在涨**；`seq/max_len` 打满 20480 预算；acc 0.539→0.560 |
+
+崩塌的特征是 **`seq/max_len` 单调收缩**，转折点在 step ~140 附近，而且两次 batch 差 4 倍
+（2048 / 512）转折点都在 140 —— **它跟的是 optimizer step 数，不是样本数**。
+
+**修之后**：在一个把响应预算压到 4096、batch 压到 256 的配方上连跑 91 步（config 也在仓库里，
+`..._verlref_4k_longrun.yaml`，专门用来把这段观测从一天缩到几小时），三个信号都反向：
+
+| 区块 | `reward/accuracy` | `seq/mean_response_len` | `rollout_corr/kl` |
+|---|---|---|---|
+| 1–20 | 0.168 | 773 | 0.00136 |
+| 21–40 | 0.366 | 800 | 0.00083 |
+| 61–80 | 0.42 | 880 | 0.00065 |
+| 81–91 | 0.42 | 925 | 0.00060 |
+
+AIME-2024 在线验证（greedy，独立于训练 batch）：
+
+| step | 20 | 40 | 80 |
+|---|---|---|---|
+| `val-core/acc/mean@1` | 0.086 | 0.159 | 0.199 |
+| `val/response_length_mean` | 1319 | 1513 | 1514 |
+
+**关键判据，按重要性排序：**
+
+1. **`seq/max_len` 不收缩。**这是长度崩塌的直接指标。它在预算上限附近波动是健康的
+   （说明每步都有序列打满），单调往下走就是崩了。
+2. **`rollout_corr/kl` 不随步数单调爬升。**降下去正常（策略变确定，log 空间分歧自然缩小）；
+   爬上去有三种可能，按概率排：router 精度两侧不匹配（§13.11）、权重同步漏参数（§13.4 的
+   `VERIFY=1` 复查）、或者又出现了对齐类 bug（§13.16 的落盘探针）。
+   健康水平是 **6e-4 ~ 1.8e-3**，和 FSDP2 同期同量级。
+3. `reward/accuracy` 与 `val-core/acc/mean@1` 单调改善；`val/response_length_mean` 增长
+   （模型学会想更久，和 §13.7 的 FSDP2 一样）。
+4. `mem/actor_allocated_gb` 恒定（Megatron 4k 下约 72GB，20k 下约 130GB）。
+   `max_reserved` 随每步 batch 波动是正常的，**存活内存在动才是泄漏**。
+5. **已知会有熵坍缩**，和 §13.7 同理（`entropy_coeff=0` 是 verl recipe 本身的选择）。
+   4k 那 91 步 entropy 从 0.71 掉到约 0.19。只有在"entropy 掉到 0.05 以下 **且** 长度开始缩"
+   同时出现时才需要警惕。
+
+### 13.15 Megatron 专属排障
+
+**显存：`HSA_STATUS_ERROR_OUT_OF_RESOURCES` / `torch.OutOfMemoryError` in `loss_func`**
+
+resp=20480 这个配置**在 `max_tokens_per_gpu: 22528` 下会在 step 14 死在 actor backward**。
+关键结论是：**崩溃不是 allocated 峰值的问题**（改前后都是约 130GB），而是**碎片** ——
+ROCm 没有 `expandable_segments`，原来每步约 7 个打满 22.5k 的 bin 反复申请释放巨块，
+reserved 比 allocated 多出 42GB。把 bin 压到 8192 之后碎片间隙塌到 4–11GB，
+**峰值 reserved 从 177GB 降到 134GB**。所以长跑 config 里那个 8192 不能随手调回去。
+
+典型报错点是 `_pp_update_policy` 的 `loss_func` 里
+`logits = lt.reshape(-1, lt.shape[-1]).float() / temperature` —— packed logits 的 fp32 上采，
+一个 6k token 的 bin 就是 3.44GiB。看到这一行 OOM，先确认是不是**别的进程占了卡**
+（`rocm-smi --showmeminfo vram`；`GPU% = 0` 但 `VRAM%` 不为 0 就是有人占着不算），
+再考虑调 `max_tokens_per_gpu` / `gpu_memory_utilization` / `recompute_granularity`。
+
+**往引擎里加探针，要加在 `_pp_update_policy`，不是基类**
+
+```python
+# megatron_native_engine.py
+if self._pp == 1 and self._cp == 1 and not getattr(self, "_is_moe", False):
+    return super().engine_update_policy(batch)
+return self._pp_update_policy(batch)
+```
+**MoE 永远走 `_pp_update_policy`**，即使 PP=1、CP=1。基类的 `engine_update_policy` 对这条线是死代码。
+`_row_policy_loss` 是两条路共用的。
+
+**往 trainer 里加逻辑，先确认在哪个函数里**
+
+`train()` 在开头就 `if self._use_ray_controller: self._train_with_ray_controller(); return`。
+Ray 路径不经过 `train()` 的主体 —— `a09b702` 之前那个 TIS 补丁就是打在了 `train()` 里，
+成了死代码，这个坑踩两次就够了。
+
+**env 变量传不到 Ray actor**
+
+actor 创建时没带 `runtime_env`，driver 侧 export 的变量到不了 actor。
+诊断探针因此用 sentinel 文件绕开（`megatron_base_engine._gap_dump_dir()`）：
+
+```bash
+# 打开 rollout_corr/kl 的落盘探针（容器内）
+sudo docker exec "$CONTAINER" bash -lc 'echo /path/to/dump > /tmp/lumenrl_gap_dump_dir'
+# 跑完记得删掉，否则每步都写
+sudo docker exec "$CONTAINER" bash -lc 'rm -f /tmp/lumenrl_gap_dump_dir'
+```
+落盘的是引擎侧三张对齐并 mask 过的 per-token 张量（train / old / rollout）加上这个 rank
+上报的标量，所以可以从原始张量把指标算术复现出来（恒等式 `rc − ppo = mean(rollout_lp − old_lp)`
+是精确成立的，实测 +0.031807 vs 报告 +0.031779，可以用它自检 dump 有没有取错）。
+当时用的四个分析脚本（`analyze_engine_gap.py` / `analyze_logprob_gap.py` /
+`wandb_fetch_run.py` / `wandb_analyze.py`）不在仓库里，只在那台机器的 run area，
+用途和判读见 `megatron-moe-length-collapse-handoff.md` §8。
+
+**vLLM worker 里的 `logger.info` 不进 driver 日志**
+
+所以 §13.4 那行 `weight sync coverage` 在这条线上看不到。**不能**据此认为断言没跑 ——
+判断断言是否触发，看它有没有抛异常。
+
+**`rollout_log_probs` 里出现精确的 `0.0`，是不是坏了？**
+
+看日志那行 INFO 里的均值。`a09b702` 之后 trainer 会打：
+
+```
+rollout_log_probs: 522 of 206171 response positions are exactly 0.0;
+substituted old_log_probs (mean -2.7e-07 there -- ...)
+```
+均值**接近 0** 说明这些 token 真的极度确信（float32 下 `log p` 下溢到 0，需要 p > 1−6e-8），
+回填成 `old_log_probs` 是无害的 no-op。均值**很负**（历史上测到 −52.3）才是真的上报缺口，
+那说明有位置对齐问题，回 §13.12。
 
 ---
 
