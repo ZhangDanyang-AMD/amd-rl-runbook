@@ -242,7 +242,68 @@ export RAY_ADDRESS=$P19_IP:6379
 bash examples/GRPO/run_grpo_dsv4.sh
 ```
 
-## 9. 故障排除
+## 9. Actor→Rollout FP8 权重同步
+
+### 9.1 方案 A：Actor 端 FP8 量化（推荐，传输量减半）
+
+Actor 在 BF16 训练后，在 GPU 上对每个 weight 做 per-128×128-block FP8 e4m3 量化，
+然后发送 FP8 weight + FP32 scale，vLLM 直接加载跳过 online requant。
+
+```
+Actor BF16 → fp8_weight_quantizer.py (per-block FP8)
+→ yield (name, fp8_weight) + (name_scale_inv, scale)
+→ RDMA broadcast (~290GB, 减半)
+→ vLLM model.load_weights → 直接写入 FP8 param + scale
+→ 不触发 prepare/finalize online requant
+```
+
+YAML 配置：
+```yaml
+weight_sync:
+  backend: rdma
+  fp8_quantize: true  # 启用 actor-side FP8 量化
+```
+
+关键文件：
+- `lumenrl/engine/inference/fp8_weight_quantizer.py` — per-block FP8 量化
+- `lumenrl/workers/actor_worker.py` — `send_weights_rdma(fp8_quantize=True)`
+- ROCm 注意：需要 `e4m3fn → e4m3fnuz` 转换（ROCm FP8 格式不同）
+
+### 9.2 方案 B：vLLM 端 online requant（Fallback）
+
+如果方案 A 格式不兼容（如 vLLM 版本不支持 pre-quantized weight update），
+回退到发送 BF16 权重 + vLLM 端 online FP8 再量化。
+
+```
+Actor BF16 → RDMA broadcast (~568GB, 全量 BF16)
+→ vLLM prepare_online_quantized_weights_for_loading
+→ model.load_weights (接收 BF16)
+→ finalize_online_quantized_weights_loading (per-block FP8 再量化)
+```
+
+YAML 配置：
+```yaml
+weight_sync:
+  backend: rdma
+  fp8_quantize: false  # 默认，vLLM 端 online requant
+```
+
+关键文件：
+- `lumenrl/engine/inference/vllm_colocate_worker_ext.py` — `receive_weights_rdma`
+  已添加 `prepare/finalize` lifecycle
+- `lumenrl/engine/inference/vllm_fp8_utils.py` — online FP8 工具函数
+
+### 9.3 方案对比
+
+| | 方案 A (actor-side FP8) | 方案 B (vLLM online requant) |
+|---|---|---|
+| 传输量 | ~290 GB (FP8+scale) | ~568 GB (BF16) |
+| RDMA 时间 | ~12s @ 200Gb/s | ~23s @ 200Gb/s |
+| 额外延迟 | actor 端量化 ~10ms | vLLM requant ~数秒 |
+| 兼容性风险 | 需要 vLLM 接受 pre-quantized | 稳定，vLLM 原生支持 |
+| ROCm | 需要 e4m3fn→e4m3fnuz 转换 | vLLM 内部已处理 |
+
+## 10. 故障排除
 
 | 症状 | 原因 | 解决 |
 |------|------|------|
