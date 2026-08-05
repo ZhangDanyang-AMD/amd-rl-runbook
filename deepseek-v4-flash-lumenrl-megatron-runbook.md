@@ -260,11 +260,36 @@ bash examples/GRPO/run_grpo_dsv4.sh
 | vLLM entrypoint 冲突 | vLLM base image 默认入口 | `--entrypoint bash` 覆盖 |
 | Python 版本不匹配 | 训练/推理容器 Python 不一致 | 统一使用 `vllm/vllm-openai-rocm:v0.25.1` base |
 
-## 10. 代码仓库
+## 10. 软件版本与代码仓库
 
-| 组件 | 仓库 | 分支 |
+### 10.1 Docker 镜像
+
+| 镜像 | Docker Hub Tag | 用途 |
+|------|---------------|------|
+| `zhangdanyangamd/lumen-rl:dsv4-300x-actor260805` | trainer (含 Megatron patch + TileKernels + tilelang) | 训练节点 |
+| `zhangdanyangamd/lumen-rl:dsv4-300x-rollout260805` | rollout (vLLM + LumenRL) | 推理节点 |
+
+Base image: `vllm/vllm-openai-rocm:v0.25.1` (Python 3.12, PyTorch 2.11)
+
+### 10.2 软件版本
+
+| 组件 | 版本 | 说明 |
 |------|------|------|
-| LumenRL | `github.com/ZhangDanyang-AMD/Lumen-RL.git` | `dev/moe-grpo` |
-| Lumen | `github.com/ZhangDanyang-AMD/Lumen.git` | PR #8 |
-| Megatron-LM | `github.com/ROCm/Megatron-LM.git` | `rocm_dev` + DSV4 patch |
-| TileKernels | `github.com/jayzlee147/TileKernels.git` | main |
+| Python | 3.12.13 | vLLM base image |
+| PyTorch | 2.11.0+gitd0c8b1f | ROCm 7.2 |
+| Ray | 2.56.1 | |
+| vLLM | 0.25.1 | rollout 推理 |
+| flash-attn | 2.8.0.post2 | ROCm gfx942 编译 |
+| tilelang | 0.1.10 | PyPI, sparse MLA kernel |
+| transformers | 5.13.1 | |
+
+### 10.3 代码仓库
+
+| 组件 | GitHub 链接 | 分支/Commit | 说明 |
+|------|-------------|-------------|------|
+| LumenRL | https://github.com/ZhangDanyang-AMD/Lumen-RL.git | `dev/dsv4-grpo` @ `4aac3d4` | DSV4 engine + bridge + configs |
+| Lumen | https://github.com/ZhangDanyang-AMD/Lumen.git | PR #8 @ `0223585` | DSV4 spec (MLA, HC, compressor, indexer) |
+| Megatron-LM | https://github.com/ROCm/Megatron-LM.git | `rocm_dev` @ `fb45524` + DSV4 patch | MLATransformerConfig + HC/DSV4 fields |
+| TileKernels | https://github.com/jayzlee147/TileKernels.git | `main` @ `c795a96` | mHC kernel |
+| tilelang | https://pypi.org/project/tilelang/ | `0.1.10` (PyPI) | Sparse MLA fwd/bwd + indexer kernel |
+| amd-rl-runbook | https://github.com/ZhangDanyang-AMD/amd-rl-runbook.git | `main` | 本 runbook |
