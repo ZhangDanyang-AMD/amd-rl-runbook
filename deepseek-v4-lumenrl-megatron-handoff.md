@@ -169,6 +169,34 @@ gfx950 上还需要三个补丁（都在 miles 的 `docker/amd_patch/latest/`）
 `~/dsv4/01_fix_tile_kernels.sh:33-42` 的 `determine_target` 兼容垫片。
 **tilelang 0.1.10 不可用**——HIP codegen 降不了 `exp2`，而稀疏 MLA 反向需要。
 
+### 3.3 权重怎么进 Megatron：miles 的两阶段路径
+
+⚠️ **反直觉的一点：原生→HF 的改名发生在第 1 阶段，不是第 2 阶段。**
+
+1. `tools/fp8_cast_bf16.py` —— 反量化 FP8 块量化**同时**给每个张量改名（改名函数就是 SGLang
+   那个 `remap_weight_name_to_dpsk_hf_format`，靠嗅探 `embed.weight` 判断是不是原生格式）。
+   产物已经是 "dpsk HF format"。
+2. `tools/convert_hf_to_torch_dist.py` —— 建 Megatron 模型、经 mbridge 加载，产出 mcore 命名的
+   分片张量（`decoder.layers.N.self_attention.wq_a.weight` 这类）。映射表在
+   `miles_plugins/mbridge/deepseekv4.py:15-71`；`_weight_to_mcore_format` 会抑制基类的 bf16 降精度，
+   这是 `attn_sink` / `compressor.ape` / `hc_*` 能保持 fp32 的原因。
+
+产物尺寸（都在节点本地盘，每台一份）：`DeepSeek-V4-Flash-FP8` 274G（SGLang 用）、
+`-bf16` 542G（只是中间产物，不分发）、`_torch_dist` 530G（Megatron 用，每个 rank 都读）。
+
+两个有用的性质：
+
+- **`torch_dist` 加载时会重新分片**——写出来是 `[t 1/1, p 1/8]`，加载成 `[t 1/8, p 1/4]`。
+  **转换时的并行度不约束训练时的并行度**，转换用 TP=PP=EP=1 就行。
+- ⚠️ **转换陷阱**：`convert_hf_to_torch_dist.py:58-64` 在 `pipeline_model_parallel_size == 1 且
+  world_size > 1` 时会**静默把 PP 改写成 world_size**，叠加 `_prepare_spmd` 硬编码的 EP=8，
+  Megatron 会拿 `ETP × EP × PP = 64` 去校验 `world_size=8` 然后挂掉。miles 的解法是转换时用 EP=1。
+
+**对我们的启示**：既然 transformers 5.13.1 能直读原生 checkpoint 并做反量化（§8），第 1 阶段
+可以不依赖 SGLang——但要注意 transformers 的目标命名和 SGLang 的"dpsk HF format"**不一致**，
+mbridge 的映射表是照着后者写的，直接换会全部对不上。要么沿用 SGLang 那份改名（vendor 过来，
+它是纯字符串函数），要么把 mbridge 的映射表改成对齐 transformers 的命名。
+
 ## 4. LumenRL 侧要改的东西
 
 来自对 `lumenrl/engine/training/megatron_native_engine.py` 的通读，按阻塞程度排序。
