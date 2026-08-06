@@ -342,6 +342,10 @@ ENV OK
 
 > - `megatron.core` 解析到 **`/root/Megatron-LM`**（镜像里的 editable 安装，`megatron-core 0.16.0rc0`）。
 >   旧 runbook 指定的是 `0.18.2`；**0.16.0rc0 实测能跑通** LumenRL 的 `megatron_native`，不要为了对齐版本号去动它。
+>   ⚠️ **但那是用 Qwen3-8B dense 验证的。`megatron_native` + MoE 会撞 megatron-core 0.16 与 TE 2.12
+>   的一处 API 漂移**（`TypeError: general_gemm() got an unexpected keyword argument 'workspace'`，
+>   踩在 MoE router gating 上，dense 模型不进这段代码）。修法见
+>   `dapo-lumenrl-4node-32gpu-runbook.md` §9.2 —— 那个补丁与节点数无关，单节点跑 MoE + Megatron 同样需要。
 > - **apex 能不能 import 取决于 PYTHONPATH 里有没有仓库 aiter**，这是本次踩到的一个陷阱。
 >   裸 `python3 -c "import apex"` 会挂在 `apex/transformer/functional/fused_rope.py:53` 的
 >   `import fused_rotary_positional_embedding`（那个 `.so` 报
@@ -1274,6 +1278,9 @@ node-local 盘上，节点没了就取不回来（见 §2 的盘位建议）。
 | 想做的事 | 去哪份 |
 |---|---|
 | BF16 + FSDP2/Megatron + MoE，vime 镜像（本文） | 就是这份 |
+| **同一套环境扩到 4 节点 32 卡** | `dapo-lumenrl-4node-32gpu-runbook.md`（多节点 Ray、跨节点 NCCL、两个 32 卡 smoke 的实测） |
+| **rollout 引擎跨多卡（TP>1）** | `lumenrl-rollout-tp-gt-1-handoff.md` |
+| **DeepSeek-V4-Flash 能跑到哪一步** | `deepseek-v4-flash-enablement-handoff.md` |
 | FP8 rollout / FP8 E2E 训练 / ATOM rollout | `dapo-lumenrl-native-vllm-fsdp-runbook.md`（§7–§12、§14） |
 | Qwen3-30B-A3B MoE（FSDP2 或 Megatron+EP=8） | 同上 §13（注意那条线要 `flydsl==0.1.8`、`LUMENRL_FP32_MOE_ROUTER` 两侧对齐） |
 | verl 原生 `recipe/dapo`（复用同一环境） | 同上 §15 |
