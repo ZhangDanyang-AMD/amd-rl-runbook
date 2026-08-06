@@ -2,7 +2,7 @@
 
 > Megatron 训练（TP4/PP4/EP4）+ vLLM FP8 rollout + RCCL/RoCE GPU Direct RDMA 权重同步
 > 硬件：3 节点 — 2 × 8 MI308X 训练 + 1 × 8 MI300X 推理
-> LumenRL：`origin/dev/moe-grpo`
+> LumenRL：`origin/dev/dsv4-grpo`
 > 超参对齐 LMSYS MILES DSV4：https://www.lmsys.org/blog/2026-07-10-rocm-miles-dsv4/
 
 ## 1. 目标架构
@@ -11,16 +11,17 @@
 
 | 节点 | 主机名 | 角色 | GPU |
 |------|--------|------|-----|
-| 训练-0 | `banff-ccs-aus-p20-14.cs-aus.dcgpu` | Megatron actor (NODE_RANK=0) | 8 × MI308X |
-| 训练-1 | `banff-ccs-aus-p20-38.cs-aus.dcgpu` | Megatron actor (NODE_RANK=1) | 8 × MI308X |
-| 推理 | `banff-ccs-aus-p19-29.cs-aus.dcgpu` | vLLM rollout + Ray head | 8 × MI300X |
+| 训练-0 | `banff-ccs-aus-p19-29.cs-aus.dcgpu` (`10.194.132.110`) | Megatron ranks 0–7 | 8 × MI308X |
+| 训练-1 | `banff-ccs-aus-p20-29.cs-aus.dcgpu` (`10.194.132.59`) | Megatron ranks 8–15 | 8 × MI308X |
+| 推理 | `banff-ccs-aus-p21-29.cs-aus.dcgpu` (`10.194.132.76`) | vLLM rollout + Ray head | 8 × MI300X |
 
 ### 1.2 训练配置
 
 - 16 个 Megatron actor worker，分布在 2 个训练节点
 - TP=4, PP=4, EP=4, ETP=1
 - Pipeline 层分布：11 + 11 + 11 + 10（共 43 层）
-- Optimizer：AdamW + CPU offload（fraction=0.75）
+- Optimizer：AdamW + CPU offload（smoke fraction=0.95）
+- NUMA affinity：自动将每个 Actor 绑定到其 GPU 所在 NUMA node 的 CPU 集合
 - 精度：BF16 compute + FP32 master params/Adam state
 - 初始权重：`/nfs/data/DeepSeek-V4-Flash`（原始 BF16 HF safetensors，568 GB）
 - Engine：`megatron_lumen_dsv4`（LumenRL 的 `MegatronLumenDSV4Engine`）
@@ -187,11 +188,21 @@ DSV4 的 HuggingFace `config.json` 字段名和 Megatron/Lumen 不同：
 ### 6.1 启动
 
 ```bash
-# Ray head（推理节点 p19-29）
-docker exec dsv4-rl ray start --head --node-ip-address=$P19_IP --port=6379 --num-gpus=8 --num-cpus=64
+# Ray head（推理节点 p21-29）
+ROLLOUT_IP=10.194.132.76
+docker exec dsv4-rl ray start --head \
+  --node-ip-address=$ROLLOUT_IP --port=6379 \
+  --num-gpus=8 --num-cpus=224 \
+  --object-store-memory=200000000000 \
+  --min-worker-port=10002 --max-worker-port=19999 \
+  --dashboard-host=0.0.0.0
 
-# 训练节点加入
-docker exec dsv4-rl ray start --address=$P19_IP:6379 --node-ip-address=$TRAIN_IP --num-gpus=8 --num-cpus=64
+# 两个训练节点分别加入（TRAIN_IP 为 10.194.132.110 / 10.194.132.59）
+docker exec dsv4-rl ray start \
+  --address=$ROLLOUT_IP:6379 --node-ip-address=$TRAIN_IP \
+  --num-gpus=8 --num-cpus=224 \
+  --object-store-memory=200000000000 \
+  --min-worker-port=10002 --max-worker-port=19999
 ```
 
 验证：`ray status` 应显示 3 nodes, 24 GPU。
@@ -200,6 +211,54 @@ docker exec dsv4-rl ray start --address=$P19_IP:6379 --node-ip-address=$TRAIN_IP
 
 Actor 使用 `process_on_nodes: [8, 8]`（无 topology_tags），Ray STRICT_PACK 自动分配到两个训练节点。
 Rollout 使用 `topology_tags: {node_ip: <推理节点IP>}` 固定到推理节点。
+
+### 6.3 失败重试前清理
+
+训练失败后不能只确认 Ray Actor 已消失；ROCm context 可能仍持有 90% 左右显存，下一次
+optimizer 初始化会在最后几十 MiB 分配时 OOM。每次失败重试前执行：
+
+```bash
+# 三台机器都执行
+docker exec dsv4-rl ray stop --force
+docker exec dsv4-rl rocm-smi --showmemuse
+```
+
+必须确认两个训练节点所有 GPU 的 VRAM 使用率回到 0%，再按 6.1 重建 Ray 集群。不要用降低
+batch size 掩盖残留 context 导致的 OOM。
+
+### 6.4 NUMA-aware Actor 初始化
+
+optimizer CPU offload 会为每个 rank 创建约百 GB 的 FP32 master params/Adam state。若 Actor
+运行在远离其 GPU 的 NUMA node 上，会出现 `migration_entry_wait_on_locked`，导致 p20
+ranks 8–15 初始化明显慢于 p19 ranks 0–7。
+
+Smoke 配置必须启用：
+
+```yaml
+policy:
+  training:
+    megatron_cfg:
+      numa_affinity: true
+```
+
+实现位于 `lumenrl/workers/numa_affinity.py`。Actor 启动时通过
+`rocm-smi --showtoponuma --json` 自动查找 GPU NUMA node，再读取
+`/sys/devices/system/node/node<N>/cpulist` 并调用 `os.sched_setaffinity`。
+探测失败只告警并继续，不阻断训练。
+
+本批节点的预期绑定：
+
+| 物理 GPU | NUMA node | CPU affinity |
+|----------|-----------|--------------|
+| 0–3 | 0 | `0-55,112-167` |
+| 4–7 | 1 | `56-111,168-223` |
+
+验证运行时绑定：
+
+```bash
+# 对每个 LumenActorWorker PID 检查
+docker exec dsv4-rl taskset -pc <PID>
+```
 
 ## 7. 数据集
 
@@ -227,6 +286,9 @@ sed "s/REPLACE_ME/${ROLLOUT_NODE_IP}/g" \
 - `model_name` → `/dev/shm/models/DeepSeek-V4-Flash`
 - `dataset` → `/dev/shm/datasets/dapo-math-17k/dapo-math-17k.jsonl`
 - `checkpoint_dir` → `/nfs/data/leiwu/ckpts/dsv4-flash-lumenrl/smoke`
+- `cluster.topology_tags.node_ip` → `10.194.132.76`
+- `weight_sync.rdma.interface` → `ens14np0`（不能保留旧节点的 `ens11np0`）
+- `policy.training.megatron_cfg.numa_affinity` → `true`
 
 ### 8.2 Smoke Test
 
@@ -237,7 +299,7 @@ export CONFIG_OVERRIDE=/runtime/configs/dsv4-smoke.yaml
 export LUMENRL_KEEP_RAY_CLUSTER=1 RESUME_OVERRIDE=false
 export WEIGHT_SYNC_BACKEND=rdma
 export GLOO_SOCKET_IFNAME=ens14np0 NCCL_SOCKET_IFNAME=ens14np0
-export RAY_ADDRESS=$P19_IP:6379
+export RAY_ADDRESS=10.194.132.76:6379
 
 bash examples/GRPO/run_grpo_dsv4.sh
 ```
@@ -314,16 +376,20 @@ weight_sync:
 | `condition_init_method` ImportError | ROCm Megatron 缺少此函数 | DSV4 patch 已添加 |
 | `experimental_attention_variant 'dsv4'` 不接受 | ROCm Megatron 未 patch | 重新执行 `patch_rocm_megatron_dsv4.py` |
 | GPU OOM | 其他容器占用 GPU | `docker stop` 其他容器释放 GPU |
+| optimizer 初始化只差 64 MiB OOM，Actor 已退出但 `rocm-smi` 仍显示约 90% | 上一轮 Ray worker/ROCm context 未完全清理 | 三节点 `ray stop --force`，确认训练 GPU VRAM 全部回到 0%，重建集群 |
+| ranks 8–15 optimizer 初始化远慢于 ranks 0–7 | CPU offload 跨 NUMA page migration | 设置 `numa_affinity: true`，用 `taskset -pc <PID>` 验证 GPU 0–3/4–7 分别绑定 NUMA 0/1 |
 | NFS 加载慢 | 16 worker 同时读 NFS | 预拷模型到 `/dev/shm` |
 | `size mismatch for wq_a.weight` | HF config 字段名不匹配 | Engine 已修复（`head_dim` vs `kv_lora_rank`） |
 | RDMA 未生效（Socket fallback） | 容器未用 `--privileged` | 必须用 `--privileged` 运行容器 |
 | Gloo transport 失败 | 缺少 `GLOO_SOCKET_IFNAME` | 设置 `GLOO_SOCKET_IFNAME=ens14np0` |
+| vLLM 启动时报 `ncclGetUniqueId` / `NCCL error: invalid usage` | YAML 中遗留不存在的 `NCCL_SOCKET_IFNAME=ens11np0`，RCCL 日志为 `Bootstrap: no socket interface found` | 将 `weight_sync.rdma.interface`、容器及启动环境统一设为 `ens14np0` |
+| `ConfigKeyError: numa_affinity not in MegatronConfig` | 只更新 YAML/Actor，未同步 config schema | 同步 `lumenrl/core/config.py`，确认 `MegatronConfig.numa_affinity: bool = False` |
 | vLLM entrypoint 冲突 | vLLM base image 默认入口 | `--entrypoint bash` 覆盖 |
 | Python 版本不匹配 | 训练/推理容器 Python 不一致 | 统一使用 `vllm/vllm-openai-rocm:v0.25.1` base |
 
-## 10. 软件版本与代码仓库
+## 11. 软件版本与代码仓库
 
-### 10.1 Docker 镜像
+### 11.1 Docker 镜像
 
 | 镜像 | Docker Hub Tag | 用途 |
 |------|---------------|------|
@@ -332,7 +398,7 @@ weight_sync:
 
 Base image: `vllm/vllm-openai-rocm:v0.25.1` (Python 3.12, PyTorch 2.11)
 
-### 10.2 软件版本
+### 11.2 软件版本
 
 | 组件 | 版本 | 说明 |
 |------|------|------|
@@ -344,7 +410,7 @@ Base image: `vllm/vllm-openai-rocm:v0.25.1` (Python 3.12, PyTorch 2.11)
 | tilelang | 0.1.10 | PyPI, sparse MLA kernel |
 | transformers | 5.13.1 | |
 
-### 10.3 代码仓库
+### 11.3 代码仓库
 
 | 组件 | GitHub 链接 | 分支/Commit | 说明 |
 |------|-------------|-------------|------|
