@@ -60,7 +60,7 @@
 | Max response | 4096 |
 | Temperature | 0.8 |
 | R3 | enabled, hard_assignment（LumenRL RouterReplay 实现） |
-| Num rollout | 3000 |
+| Num rollout | 200 |
 | 数据集 | `zhuzilin/dapo-math-17k`（JSONL） |
 | 验证集 | `zhuzilin/aime-2024`（JSONL） |
 
@@ -289,13 +289,110 @@ sed "s/REPLACE_ME/${ROLLOUT_NODE_IP}/g" \
 - `cluster.topology_tags.node_ip` → `10.194.132.76`
 - `weight_sync.rdma.interface` → `ens14np0`（不能保留旧节点的 `ens11np0`）
 - `policy.training.megatron_cfg.numa_affinity` → `true`
+- `policy.generation.vllm_cfg.disable_custom_all_reduce` → `true`
 
-### 8.2 Smoke Test
+MI300X 上的 vLLM TP=8 rollout 必须禁用 AITER custom all-reduce，改用 RCCL：
+
+```yaml
+policy:
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 8
+      disable_custom_all_reduce: true
+```
+
+对应配置需要同时存在于 `VLLMConfig` schema，并由
+`RLTrainer._setup_ray_vllm_rollout()` 传给 vLLM `AsyncEngineArgs`。
+
+### 8.2 训练前测试清单（必须全部通过）
+
+所有测试必须在 GPU 空闲、三节点 Ray 集群已启动且运行时代码已同步后执行。任一项失败都不能启动正式训练。
+
+#### A. 静态检查与核心单测
+
+在 LumenRL 源码目录执行：
+
+```bash
+git diff --check
+python -m pytest \
+  tests/unit/test_config.py \
+  tests/unit/test_fp8_weight_quantizer.py \
+  tests/unit/test_rdma_weight_transfer.py \
+  tests/unit/test_vllm_colocate_worker_ext.py \
+  tests/unit/test_vllm_ray_server.py \
+  tests/unit/test_patch_rocm_megatron_dsv4.py \
+  tests/unit/engine/test_megatron_lumen_dsv4_engine.py \
+  tests/unit/engine/test_megatron_r3_pp.py \
+  -q
+```
+
+检查范围包括 YAML schema、trainer-side FP8 block quantization、RDMA protocol/capability
+handshake、vLLM pre-quantized reload metadata、Megatron DSV4 capability gate 和 R3 PP replay。
+
+#### B. 三节点代码与集群一致性
+
+```bash
+# Ray head 容器内
+export RAY_ADDRESS=10.194.132.76:6379
+ray status
+python3 deploy_ray_runtime_files.py
+```
+
+验收：
+- Ray 显示 3 个 alive nodes、24 GPUs；
+- 部署脚本返回的每个文件在三节点 SHA256 完全相同；
+- `lumenrl`、Megatron、vLLM 实际 import path 指向预期运行目录；
+- 没有遗留的 `lumenrl.trainer.main`、`VLLMRayServer` 或 `EngineCore`；
+- 两个训练节点 `rocm-smi --showmemuse` 显示 GPU VRAM 已释放。
+
+#### C. 跨节点 Gloo/RCCL-RDMA
+
+在三节点均空闲时从 Ray head 执行：
+
+```bash
+export RAY_ADDRESS=10.194.132.76:6379
+python3 diagnose_ray_collectives.py
+```
+
+验收：
+- Gloo 3-rank `all_reduce` 成功；
+- RCCL 3-rank GPU `all_reduce` 成功；
+- 所有 rank 使用 `ens14np0`、`mlx5_0`、GID 3，不能出现 Socket fallback。
+
+#### D. ROCm FP8 与 vLLM reload runtime probes
+
+在 rollout 节点容器、GPU 空闲时执行：
+
+```bash
+python3 verify_fp8_quantizer_runtime.py
+python3 verify_vllm_prequantized_metadata_runtime.py
+```
+
+验收：
+- trainer quantizer 与 vLLM `per_block_cast_to_fp8` dtype/scale 一致；
+- FP8 byte mismatch 不超过 probe 阈值；
+- reload 前恢复 `ModelWeightParameter`、`BlockQuantScaleParameter`、loader 和 TP metadata；
+- resident weight/scale storage pointer 不变。
+
+#### E. R3 router parity 与 PP replay
+
+```bash
+python3 tests/integration/run_dsv4_hash_router_parity.py
+torchrun --standalone --nproc-per-node=4 \
+  tests/integration/run_dsv4_r3_pp_recompute.py
+```
+
+验收：
+- 输出 `HASH_TID2EID_WEIGHT_PARITY_OK`；
+- PP4 每个 stage 的 forward/recompute route 完全一致；
+- 无 missing/duplicate PP layers，无 replay FIFO 错位。
+
+### 8.3 一步分布式 Smoke Test
 
 ```bash
 export RL_ROOT=/workspace DATA_ROOT=/runtime
-export MODE=smoke STEPS=3
-export CONFIG_OVERRIDE=/runtime/configs/dsv4-smoke.yaml
+export MODE=smoke STEPS=1
+export CONFIG_OVERRIDE=/workspace/Lumen-RL/dsv4-smoke-trainer-fp8.yaml
 export LUMENRL_KEEP_RAY_CLUSTER=1 RESUME_OVERRIDE=false
 export WEIGHT_SYNC_BACKEND=rdma
 export GLOO_SOCKET_IFNAME=ens14np0 NCCL_SOCKET_IFNAME=ens14np0
@@ -303,6 +400,36 @@ export RAY_ADDRESS=10.194.132.76:6379
 
 bash examples/GRPO/run_grpo_dsv4.sh
 ```
+
+Smoke 验收条件：
+- 进程 `exit=0` 且输出 `step=1`；
+- `RDMA weight sync committed`，`fp8_location=trainer`，传输约 286 GB；
+- 每个 vLLM worker 恢复 FP8 loader metadata，且完成 full-load verification；
+- `moe/r3_route_coverage=1`；
+- `moe/r3_hash_flips=0`、`moe/r3_recompute_flips=0`；
+- `moe/r3_pp_missing_layers=0`、`moe/r3_pp_duplicate_layers=0`。
+
+### 8.4 正式 200-step 训练
+
+W&B key 放在 `/workspace/wandb.key`，权限设为 `0600`；文件内容可为裸 key 或
+`WANDB_API_KEY=<key>`。禁止提交该文件。
+
+```bash
+export RL_ROOT=/workspace DATA_ROOT=/runtime
+export MODE=longrun STEPS=200
+export TRAIN_FILE=/dev/shm/datasets/dapo-math-17k/dapo-math-17k.jsonl
+export VAL_FILE=/dev/shm/datasets/aime-2024/aime-2024.jsonl
+export WANDB_RUN_NAME=dsv4-flash-grpo-trainer-fp8-200step
+export LUMENRL_KEEP_RAY_CLUSTER=1 RESUME_OVERRIDE=true
+export WEIGHT_SYNC_BACKEND=rdma
+export GLOO_SOCKET_IFNAME=ens14np0 NCCL_SOCKET_IFNAME=ens14np0
+export RAY_ADDRESS=10.194.132.76:6379
+
+bash examples/GRPO/run_grpo_dsv4.sh
+```
+
+W&B project 固定为 `danyzhan-amd/LumenRL`。正式训练启动后先确认 W&B run 已创建，
+再确认第一个 step 的 trainer-side FP8 RDMA reload、R3 diagnostics 和 checkpoint 路径正常。
 
 ## 9. Actor→Rollout FP8 权重同步
 
@@ -323,7 +450,7 @@ YAML 配置：
 ```yaml
 weight_sync:
   backend: rdma
-  fp8_quantize: true  # 启用 actor-side FP8 量化
+  fp8_quantization_location: trainer
 ```
 
 关键文件：
@@ -347,7 +474,7 @@ YAML 配置：
 ```yaml
 weight_sync:
   backend: rdma
-  fp8_quantize: false  # 默认，vLLM 端 online requant
+  fp8_quantization_location: inference
 ```
 
 关键文件：
@@ -384,6 +511,7 @@ weight_sync:
 | Gloo transport 失败 | 缺少 `GLOO_SOCKET_IFNAME` | 设置 `GLOO_SOCKET_IFNAME=ens14np0` |
 | vLLM 启动时报 `ncclGetUniqueId` / `NCCL error: invalid usage` | YAML 中遗留不存在的 `NCCL_SOCKET_IFNAME=ens11np0`，RCCL 日志为 `Bootstrap: no socket interface found` | 将 `weight_sync.rdma.interface`、容器及启动环境统一设为 `ens14np0` |
 | `ConfigKeyError: numa_affinity not in MegatronConfig` | 只更新 YAML/Actor，未同步 config schema | 同步 `lumenrl/core/config.py`，确认 `MegatronConfig.numa_affinity: bool = False` |
+| vLLM `EngineCore failed to start`，AITER 报 `hipIpcGetMemHandle ... invalid argument` | vLLM TP=8 默认启用了 AITER custom all-reduce；当前 MI300X/ROCm 组合无法为通信 buffer 创建 HIP IPC handle | 设置 `policy.generation.vllm_cfg.disable_custom_all_reduce: true`，并确认启动日志显示 `disable_custom_all_reduce=True`，使 TP collective 回退到 RCCL |
 | vLLM entrypoint 冲突 | vLLM base image 默认入口 | `--entrypoint bash` 覆盖 |
 | Python 版本不匹配 | 训练/推理容器 Python 不一致 | 统一使用 `vllm/vllm-openai-rocm:v0.25.1` base |
 
@@ -405,7 +533,7 @@ Base image: `vllm/vllm-openai-rocm:v0.25.1` (Python 3.12, PyTorch 2.11)
 | Python | 3.12.13 | vLLM base image |
 | PyTorch | 2.11.0+gitd0c8b1f | ROCm 7.2 |
 | Ray | 2.56.1 | |
-| vLLM | 0.25.1 | rollout 推理 |
+| vLLM | 0.25.1+rocm723 | rollout 推理；wheel VCS commit `752a3a504` |
 | flash-attn | 2.8.0.post2 | ROCm gfx942 编译 |
 | tilelang | 0.1.10 | PyPI, sparse MLA kernel |
 | transformers | 5.13.1 | |
@@ -416,7 +544,8 @@ Base image: `vllm/vllm-openai-rocm:v0.25.1` (Python 3.12, PyTorch 2.11)
 |------|-------------|-------------|------|
 | LumenRL | https://github.com/ZhangDanyang-AMD/Lumen-RL.git | `dev/dsv4-grpo` @ `4aac3d4` | DSV4 engine + bridge + configs |
 | Lumen | https://github.com/ZhangDanyang-AMD/Lumen.git | PR #8 @ `0223585` | DSV4 spec (MLA, HC, compressor, indexer) |
-| Megatron-LM | https://github.com/ROCm/Megatron-LM.git | `rocm_dev` @ `fb45524` + DSV4 patch | MLATransformerConfig + HC/DSV4 fields |
+| Megatron-LM | https://github.com/ROCm/Megatron-LM.git | `rocm_dev` @ `fb4552449f9b33c6f72207a80e80045eadf5267e` | 运行时 working tree 已应用 DSV4/R3/ROCm patch |
+| vLLM | https://github.com/vllm-project/vllm.git | `0.25.1` @ `752a3a504` | 运行 wheel 为 `0.25.1+rocm723`；wheel 仅保留短 VCS commit |
 | TileKernels | https://github.com/jayzlee147/TileKernels.git | `main` @ `c795a96` | mHC kernel |
 | tilelang | https://pypi.org/project/tilelang/ | `0.1.10` (PyPI) | Sparse MLA fwd/bwd + indexer kernel |
 | amd-rl-runbook | https://github.com/ZhangDanyang-AMD/amd-rl-runbook.git | `main` | 本 runbook |
