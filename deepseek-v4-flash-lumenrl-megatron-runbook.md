@@ -5,6 +5,24 @@
 > LumenRL：`origin/dev/dsv4-grpo`
 > 超参对齐 LMSYS MILES DSV4：https://www.lmsys.org/blog/2026-07-10-rocm-miles-dsv4/
 
+## 0. 2026-08-10 当前已验证状态
+
+- 训练节点为 p19-29 + **p22-05**，p20-29 不属于当前集群；p21-29 继续作为 rollout/Ray head。
+- v35 已完成一个完整的 32×8 GRPO step：256 条 rollout、old log-probs、forward/backward、
+  streamed Adam、568 GB 级权重同步和 30 条 AIME eval 均执行完毕。
+- Megatron 初始化 OOM 已通过 `use_precision_aware_optimizer: true` 解决。该模式避免在 GPU
+  上一次性克隆完整 FP32 master weights，再配合 full optimizer CPU offload、BF16 moments 和
+  256 MiB streamed-Adam staging，将训练峰值显存控制在约 75.8 GB/GPU。
+- rollout GPU memory fault 已消失。当前通过配置为
+  `enable_chunked_prefill: true`、`enable_prefix_caching: false`；
+  **没有证据表明开启 prefix cache 修复了问题**，正式配置仍应关闭 prefix cache，除非重新完成 A/B。
+- 独立权重同步 A/B（不执行 RL、backward 或 optimizer step）确认：
+  trainer-side FP8 pre-quantization 会使同步后的 vLLM 输出立即退化为重复的 `Aime`、`0`、`n`
+  等模式；inference-side online FP8 同步后输出保持连贯。因此正式训练必须设置
+  `fp8_quantization_location: inference`。
+- v38 200-step 长跑已启动：rollout log-probs、token IS、batch normalization、R3 全部开启；
+  checkpoint 每 5 步保存到共享 NFS，最多保留 2 份。
+
 ## 1. 目标架构
 
 ### 1.1 节点角色
@@ -12,7 +30,7 @@
 | 节点 | 主机名 | 角色 | GPU |
 |------|--------|------|-----|
 | 训练-0 | `banff-ccs-aus-p19-29.cs-aus.dcgpu` (`10.194.132.110`) | Megatron ranks 0–7 | 8 × MI308X |
-| 训练-1 | `banff-ccs-aus-p20-29.cs-aus.dcgpu` (`10.194.132.59`) | Megatron ranks 8–15 | 8 × MI308X |
+| 训练-1 | `banff-ccs-aus-p22-05.cs-aus.dcgpu` (`10.194.132.65`) | Megatron ranks 8–15 | 8 × MI308X |
 | 推理 | `banff-ccs-aus-p21-29.cs-aus.dcgpu` (`10.194.132.76`) | vLLM rollout + Ray head | 8 × MI300X |
 
 ### 1.2 训练配置
@@ -20,9 +38,9 @@
 - 16 个 Megatron actor worker，分布在 2 个训练节点
 - TP=4, PP=4, EP=4, ETP=1
 - Pipeline 层分布：11 + 11 + 11 + 10（共 43 层）
-- Optimizer：AdamW + CPU offload（smoke fraction=0.95）
+- Optimizer：AdamW + full CPU offload + precision-aware optimizer + BF16 moments
 - NUMA affinity：自动将每个 Actor 绑定到其 GPU 所在 NUMA node 的 CPU 集合
-- 精度：BF16 compute + FP32 master params/Adam state
+- 精度：BF16 compute；precision-aware path 避免 GPU 侧完整 FP32 master-weight clone
 - 初始权重：`/nfs/data/DeepSeek-V4-Flash`（原始 BF16 HF safetensors，568 GB）
 - Engine：`megatron_lumen_dsv4`（LumenRL 的 `MegatronLumenDSV4Engine`）
 - Megatron：ROCm/Megatron-LM `rocm_dev` + DSV4 patch
@@ -36,6 +54,8 @@
 - KV cache：`fp8_e4m3`
 - `enforce_eager: true`（不使用 cudagraph）
 - MoE backend：`triton`
+- Chunked prefill：`enable_chunked_prefill: true`
+- Prefix cache：`enable_prefix_caching: false`（当前 32×8 rollout 的已验证配置）
 
 ### 1.4 权重同步
 
@@ -72,7 +92,7 @@
 |------|------|----------|------|
 | 模型权重（HF） | `/dev/shm/models/DeepSeek-V4-Flash` | tmpfs (内存) | 16 worker 并发读，NFS 太慢 |
 | 数据集 | `/dev/shm/datasets/` | tmpfs | 小文件，快速访问 |
-| Checkpoint | `/nfs/data/leiwu/ckpts/dsv4-flash-lumenrl/` | NFS | 需要持久化，save_steps 设大（50+） |
+| Checkpoint | `/nfs/data/danyzhan/lumenrl_ckpts/dsv4-flash-200step-is-r3/` | NFS | 每 5 步保存，最多保留 2 份 |
 | 日志 | `/nfs/data/leiwu/logs/` 或宿主机挂载 | NFS/本地 | 需要持久化 |
 
 ### 2.2 模型预加载
@@ -197,7 +217,7 @@ docker exec dsv4-rl ray start --head \
   --min-worker-port=10002 --max-worker-port=19999 \
   --dashboard-host=0.0.0.0
 
-# 两个训练节点分别加入（TRAIN_IP 为 10.194.132.110 / 10.194.132.59）
+# 两个训练节点分别加入（TRAIN_IP 为 10.194.132.110 / 10.194.132.65）
 docker exec dsv4-rl ray start \
   --address=$ROLLOUT_IP:6379 --node-ip-address=$TRAIN_IP \
   --num-gpus=8 --num-cpus=224 \
@@ -289,7 +309,11 @@ sed "s/REPLACE_ME/${ROLLOUT_NODE_IP}/g" \
 - `cluster.topology_tags.node_ip` → `10.194.132.76`
 - `weight_sync.rdma.interface` → `ens14np0`（不能保留旧节点的 `ens11np0`）
 - `policy.training.megatron_cfg.numa_affinity` → `true`
+- `policy.training.megatron_cfg.use_precision_aware_optimizer` → `true`
 - `policy.generation.vllm_cfg.disable_custom_all_reduce` → `true`
+- `policy.generation.vllm_cfg.enable_chunked_prefill` → `true`
+- `policy.generation.vllm_cfg.enable_prefix_caching` → `false`
+- `weight_sync.fp8_quantization_location` → `inference`
 
 MI300X 上的 vLLM TP=8 rollout 必须禁用 AITER custom all-reduce，改用 RCCL：
 
@@ -392,9 +416,10 @@ torchrun --standalone --nproc-per-node=4 \
 ```bash
 export RL_ROOT=/workspace DATA_ROOT=/runtime
 export MODE=smoke STEPS=1
-export CONFIG_OVERRIDE=/workspace/Lumen-RL/dsv4-smoke-trainer-fp8.yaml
+export CONFIG_OVERRIDE=/workspace/Lumen-RL/examples/GRPO/configs/grpo_dsv4_flash_vllm_longrun.yaml
 export LUMENRL_KEEP_RAY_CLUSTER=1 RESUME_OVERRIDE=false
 export WEIGHT_SYNC_BACKEND=rdma
+export FP8_QUANTIZATION_LOCATION=inference
 export GLOO_SOCKET_IFNAME=ens14np0 NCCL_SOCKET_IFNAME=ens14np0
 export RAY_ADDRESS=10.194.132.76:6379
 
@@ -403,8 +428,8 @@ bash examples/GRPO/run_grpo_dsv4.sh
 
 Smoke 验收条件：
 - 进程 `exit=0` 且输出 `step=1`；
-- `RDMA weight sync committed`，`fp8_location=trainer`，传输约 286 GB；
-- 每个 vLLM worker 恢复 FP8 loader metadata，且完成 full-load verification；
+- `RDMA weight sync committed`，`fp8_location=inference`，传输约 568 GB；
+- 每个 vLLM worker 完成 online FP8 prepare/load/finalize 和 full-load verification；
 - `moe/r3_route_coverage=1`；
 - `moe/r3_hash_flips=0`、`moe/r3_recompute_flips=0`；
 - `moe/r3_pp_missing_layers=0`、`moe/r3_pp_duplicate_layers=0`。
@@ -419,9 +444,13 @@ export RL_ROOT=/workspace DATA_ROOT=/runtime
 export MODE=longrun STEPS=200
 export TRAIN_FILE=/dev/shm/datasets/dapo-math-17k/dapo-math-17k.jsonl
 export VAL_FILE=/dev/shm/datasets/aime-2024/aime-2024.jsonl
-export WANDB_RUN_NAME=dsv4-flash-grpo-trainer-fp8-200step
-export LUMENRL_KEEP_RAY_CLUSTER=1 RESUME_OVERRIDE=true
+export WANDB_RUN_NAME=dsv4-flash-grpo-200step-is-r3-inference-fp8-v38
+export LUMENRL_KEEP_RAY_CLUSTER=1 RESUME_OVERRIDE=false
 export WEIGHT_SYNC_BACKEND=rdma
+export FP8_QUANTIZATION_LOCATION=inference
+export CHECKPOINT_SAVE_STEPS=5
+export CHECKPOINT_SAVE_TOTAL_LIMIT=2
+export CKPT_DIR=/nfs/data/danyzhan/lumenrl_ckpts/dsv4-flash-200step-is-r3
 export GLOO_SOCKET_IFNAME=ens14np0 NCCL_SOCKET_IFNAME=ens14np0
 export RAY_ADDRESS=10.194.132.76:6379
 
@@ -429,11 +458,12 @@ bash examples/GRPO/run_grpo_dsv4.sh
 ```
 
 W&B project 固定为 `danyzhan-amd/LumenRL`。正式训练启动后先确认 W&B run 已创建，
-再确认第一个 step 的 trainer-side FP8 RDMA reload、R3 diagnostics 和 checkpoint 路径正常。
+再确认第一个 step 的 inference-side FP8 RDMA reload 和 R3 diagnostics；第 5 步必须验证
+NFS checkpoint 的 Megatron distributed-checkpoint shards、metadata 和恢复 step 完整。
 
 ## 9. Actor→Rollout FP8 权重同步
 
-### 9.1 方案 A：Actor 端 FP8 量化（推荐，传输量减半）
+### 9.1 方案 A：Actor 端 FP8 量化（当前禁用）
 
 Actor 在 BF16 训练后，在 GPU 上对每个 weight 做 per-128×128-block FP8 e4m3 量化，
 然后发送 FP8 weight + FP32 scale，vLLM 直接加载跳过 online requant。
@@ -453,15 +483,21 @@ weight_sync:
   fp8_quantization_location: trainer
 ```
 
+2026-08-10 独立验证结果：两次 RDMA 均完整发送 285.9 GB、manifest 检查通过，但第一次同步
+后固定 prompts 立即从连贯推理退化为重复 token。当前 reload fingerprint 仅检查 change
+correspondence，日志明确标记 `no source/target value-tolerance parity`，因此 manifest 成功不能
+证明 FP8 weight/scale 数值正确。修复 trainer quantizer/scale loader 并增加逐值 parity 前，
+禁止用于正式训练。
+
 关键文件：
 - `lumenrl/engine/inference/fp8_weight_quantizer.py` — per-block FP8 量化
 - `lumenrl/workers/actor_worker.py` — `send_weights_rdma(fp8_quantize=True)`
 - ROCm 注意：需要 `e4m3fn → e4m3fnuz` 转换（ROCm FP8 格式不同）
 
-### 9.2 方案 B：vLLM 端 online requant（Fallback）
+### 9.2 方案 B：vLLM 端 online requant（当前正式方案）
 
-如果方案 A 格式不兼容（如 vLLM 版本不支持 pre-quantized weight update），
-回退到发送 BF16 权重 + vLLM 端 online FP8 再量化。
+发送 BF16 权重，并由 vLLM online FP8 再量化。独立 A/B 中两次同步相同 Megatron 权重后
+固定 prompts 仍保持连贯；当前正式训练必须使用此路径。
 
 ```
 Actor BF16 → RDMA broadcast (~568GB, 全量 BF16)
@@ -489,7 +525,7 @@ weight_sync:
 | 传输量 | ~290 GB (FP8+scale) | ~568 GB (BF16) |
 | RDMA 时间 | ~12s @ 200Gb/s | ~23s @ 200Gb/s |
 | 额外延迟 | actor 端量化 ~10ms | vLLM requant ~数秒 |
-| 兼容性风险 | 需要 vLLM 接受 pre-quantized | 稳定，vLLM 原生支持 |
+| 兼容性风险 | **已复现同步后输出退化，当前禁止** | 已通过独立同步 A/B |
 | ROCm | 需要 e4m3fn→e4m3fnuz 转换 | vLLM 内部已处理 |
 
 ## 10. 故障排除
@@ -504,6 +540,9 @@ weight_sync:
 | `experimental_attention_variant 'dsv4'` 不接受 | ROCm Megatron 未 patch | 重新执行 `patch_rocm_megatron_dsv4.py` |
 | GPU OOM | 其他容器占用 GPU | `docker stop` 其他容器释放 GPU |
 | optimizer 初始化只差 64 MiB OOM，Actor 已退出但 `rocm-smi` 仍显示约 90% | 上一轮 Ray worker/ROCm context 未完全清理 | 三节点 `ray stop --force`，确认训练 GPU VRAM 全部回到 0%，重建集群 |
+| 初始化 optimizer 时 GPU OOM，即使没有残留进程 | DistributedOptimizer 先在 GPU 创建完整 FP32 master-weight clone，峰值超过 MI308X 容量 | 设置 `use_precision_aware_optimizer: true`，启用 full CPU offload、BF16 moments 和 streamed Adam |
+| trainer-side FP8 同步成功但 eval/rollout 变成 `Aime`、`0`、`n` 等重复输出 | pre-quantized FP8 weight/scale 数值或 loader 对应错误；manifest 校验不覆盖源/目标逐值 parity | 设置 `fp8_quantization_location: inference`；不要将 `manifest=checked` 当作数值正确 |
+| 怀疑 prefix cache 导致或修复 rollout fault | 当前通过配置实际为 `enable_prefix_caching: false`，没有“开启后修复”的 A/B 证据 | 保持 prefix cache 关闭、chunked prefill 开启；修改前必须运行固定 prompts + 32×8 A/B |
 | ranks 8–15 optimizer 初始化远慢于 ranks 0–7 | CPU offload 跨 NUMA page migration | 设置 `numa_affinity: true`，用 `taskset -pc <PID>` 验证 GPU 0–3/4–7 分别绑定 NUMA 0/1 |
 | NFS 加载慢 | 16 worker 同时读 NFS | 预拷模型到 `/dev/shm` |
 | `size mismatch for wq_a.weight` | HF config 字段名不匹配 | Engine 已修复（`head_dim` vs `kv_lora_rank`） |
