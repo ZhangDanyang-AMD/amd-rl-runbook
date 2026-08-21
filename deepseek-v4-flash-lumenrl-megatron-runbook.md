@@ -41,10 +41,15 @@
 - Optimizer：AdamW + full CPU offload + precision-aware optimizer + BF16 moments
 - NUMA affinity：自动将每个 Actor 绑定到其 GPU 所在 NUMA node 的 CPU 集合
 - 精度：BF16 compute；precision-aware path 避免 GPU 侧完整 FP32 master-weight clone
-- 初始权重：`/nfs/data/DeepSeek-V4-Flash`（原始 BF16 HF safetensors，568 GB）
+- Megatron `TransformerConfig.fp8=None`，DSV4 activation QAT 不执行；FP8 仅属于 rollout
+  和 inference-side online requantization，不能将两者混为 FP8 actor training
+- 初始权重：`/dev/shm/models/DeepSeek-V4-Flash-BF16`
+  （`RedHatAI/DeepSeek-V4-Flash-BF16`，原始 BF16 HF safetensors，约 568 GB）
 - Engine：`megatron_lumen_dsv4`（LumenRL 的 `MegatronLumenDSV4Engine`）
 - Megatron：ROCm/Megatron-LM `rocm_dev` + DSV4 patch
-- Kernel：Lumen DSV4 spec（MLA attention、HC、compressor、indexer）+ TileKernels（mHC、sparse MLA）+ tilelang（PyPI）
+- Kernel：Lumen DSV4 spec + AIter mHC + TileLang indexer + Triton sparse MLA。
+  TileLang sparse MLA 已接入为 MI355X/MILES 对照入口，但当前 MI308X 环境 backward
+  无法编译（`tirx.exp2`），因此 BF16 actor 不能将其设为默认
 
 ### 1.3 推理配置
 
@@ -90,78 +95,124 @@
 
 | 用途 | 路径 | 存储类型 | 原因 |
 |------|------|----------|------|
-| 模型权重（HF） | `/dev/shm/models/DeepSeek-V4-Flash` | tmpfs (内存) | 16 worker 并发读，NFS 太慢 |
+| 模型权重（HF） | `/dev/shm/models/DeepSeek-V4-Flash-BF16` | tmpfs (内存) | 16 worker 并发读，NFS 太慢 |
 | 数据集 | `/dev/shm/datasets/` | tmpfs | 小文件，快速访问 |
 | Checkpoint | `/nfs/data/danyzhan/lumenrl_ckpts/dsv4-flash-200step-is-r3/` | NFS | 每 5 步保存，最多保留 2 份 |
 | 日志 | `/nfs/data/leiwu/logs/` 或宿主机挂载 | NFS/本地 | 需要持久化 |
 
-### 2.2 模型预加载
+### 2.2 从 Hugging Face 预加载模型和数据集
 
-训练前需将 568 GB BF16 模型从 NFS 复制到两个训练节点的 `/dev/shm`：
+三台节点都直接从 Hugging Face 下载相同资产。模型必须使用
+`RedHatAI/DeepSeek-V4-Flash-BF16`，不要下载官方 FP4/FP8 mixed 仓库。
 
 ```bash
-# 在每个训练节点执行
-mkdir -p /dev/shm/models
-cp -a /nfs/data/DeepSeek-V4-Flash /dev/shm/models/
+python3 -m venv ~/.cache/dsv4-hf-venv
+~/.cache/dsv4-hf-venv/bin/pip install 'huggingface_hub[hf_xet]'
+
+HF_XET_HIGH_PERFORMANCE=1 ~/.cache/dsv4-hf-venv/bin/python - <<'PY'
+from huggingface_hub import snapshot_download
+
+snapshot_download(
+    "RedHatAI/DeepSeek-V4-Flash-BF16",
+    local_dir="/dev/shm/models/DeepSeek-V4-Flash-BF16",
+    max_workers=16,
+)
+snapshot_download(
+    "zhuzilin/dapo-math-17k",
+    repo_type="dataset",
+    local_dir="/dev/shm/datasets/dapo-math-17k",
+    max_workers=8,
+)
+snapshot_download(
+    "zhuzilin/aime-2024",
+    repo_type="dataset",
+    local_dir="/dev/shm/datasets/aime-2024",
+    max_workers=8,
+)
+PY
 ```
 
 **注意**：`/dev/shm` 是 tmpfs（内存），节点重启后丢失。`--ipc=host` 的 Docker 容器共享宿主机 `/dev/shm`。
 
 ## 3. Docker 镜像
 
-### 3.1 统一 base image
+### 3.1 最终镜像和节点分配
 
-训练和推理使用同一 base image `vllm/vllm-openai-rocm:v0.25.1`（Python 3.12, PyTorch 2.11），
-保证 Ray 集群跨节点 Python 版本一致。
+Docker Hub 上的 260813 tag 是可直接运行的最终环境，已经包含匹配的
+`Lumen-RL`、`Lumen`、AIter、Megatron、vLLM 和 ROCm 依赖。部署节点只负责
+拉取和启动，不在服务器上修改或重新安装代码。
 
-使用 `Dockerfile.dsv4` 构建：
+| 角色 | Docker Hub 最终镜像 | 节点 |
+|------|----------------------|------|
+| trainer | `zhangdanyangamd/lumen-rl:dsv4-300x-train260813` | f293、f294 |
+| rollout | `zhangdanyangamd/lumen-rl:dsv4-300x-rollout260813` | f2b9 |
+
+### 3.2 从 Docker Hub 拉取镜像
 
 ```bash
-cd ~/Lumen-RL
-docker build -f examples/GRPO/Dockerfile.dsv4 --target trainer -t dsv4-flash:trainer .
-docker build -f examples/GRPO/Dockerfile.dsv4 --target rollout -t dsv4-flash:rollout .
+# 需要私有仓库权限时先登录；不要把 token 写进脚本或 runbook
+docker login
+
+# f293 / f294
+docker pull zhangdanyangamd/lumen-rl:dsv4-300x-train260813
+
+# f2b9（该节点当前需要 sudo 访问 Docker daemon）
+sudo docker pull zhangdanyangamd/lumen-rl:dsv4-300x-rollout260813
 ```
 
-### 3.2 容器内额外安装
-
-Dockerfile build 后，容器内还需：
+拉取后核对镜像：
 
 ```bash
-# 1. ROCm Megatron + DSV4 patch
-git clone --depth 1 https://github.com/ROCm/Megatron-LM.git -b rocm_dev /tmp/rocm-megatron
-cp -a /tmp/rocm-megatron /workspace/Megatron-LM
-python3 /workspace/Lumen-RL/examples/GRPO/dsv4/patch_rocm_megatron_dsv4.py /workspace/Megatron-LM
-
-# 2. TileKernels (mHC kernel)
-pip uninstall tile_kernels -y
-pip install --no-deps -e /path/to/TileKernels  # from jayzlee147/TileKernels.git
-
-# 3. tilelang (PyPI, sparse MLA kernel)
-pip install tilelang
+docker image inspect zhangdanyangamd/lumen-rl:dsv4-300x-train260813 \
+  --format '{{.Id}} {{.RepoDigests}}'
 ```
 
-安装完成后 `docker commit` 保存为镜像。
+### 3.3 从最终镜像直接启动容器
 
-### 3.3 启动容器
+训练节点 f293、f294：
 
 ```bash
-docker run -d --name dsv4-rl \
+docker rm -f dsv4-train 2>/dev/null || true
+docker run -d --name dsv4-train \
   --privileged --network=host --ipc=host --shm-size=128g \
   -v /dev/infiniband:/dev/infiniband \
-  -v ~/Lumen-RL:/workspace/Lumen-RL \
   -v /nfs/data:/nfs/data \
-  -v ~/dsv4-runtime:/runtime \
   -e GLOO_SOCKET_IFNAME=ens14np0 \
   -e NCCL_SOCKET_IFNAME=ens14np0 \
-  --entrypoint bash \
-  dsv4-flash:trainer-ready -c "sleep infinity"
+  --entrypoint /usr/bin/sleep \
+  zhangdanyangamd/lumen-rl:dsv4-300x-train260813 infinity
+```
+
+rollout 节点 f2b9：
+
+```bash
+sudo docker rm -f dsv4-rollout 2>/dev/null || true
+sudo docker run -d --name dsv4-rollout \
+  --privileged --network=host --ipc=host --shm-size=128g \
+  -v /dev/infiniband:/dev/infiniband \
+  -v /nfs/data:/nfs/data \
+  -e GLOO_SOCKET_IFNAME=ens14np0 \
+  -e NCCL_SOCKET_IFNAME=ens14np0 \
+  --entrypoint /usr/bin/sleep \
+  zhangdanyangamd/lumen-rl:dsv4-300x-rollout260813 infinity
 ```
 
 **关键点**：
 - `--privileged` 是 InfiniBand/RDMA 正常工作的必要条件
-- `--entrypoint bash` 覆盖 vLLM 默认入口
+- 显式覆盖基础镜像 ENTRYPOINT，避免容器启动后立即退出
 - `--ipc=host` 共享宿主机 `/dev/shm`（可访问预加载的模型权重）
-- 不挂载宿主机 Lumen（用 Docker 镜像内构建的版本，保证和 Megatron 版本匹配）
+- 不挂载宿主机 Lumen-RL、Lumen 或 AIter；三仓代码已固化在镜像中
+- 只挂载需要持久化的 NFS checkpoint/log 路径和 RDMA 设备
+
+启动后检查：
+
+```bash
+docker ps --filter name=dsv4-train
+docker exec dsv4-train python3 -c \
+  'import aiter,lumen,lumenrl; print(aiter.__file__, lumen.__file__, lumenrl.__file__)'
+docker exec dsv4-train rocm-smi --showproductname
+test -f /dev/shm/models/DeepSeek-V4-Flash-BF16/config.json
+```
 
 ## 4. Megatron DSV4 Patch
 
@@ -303,7 +354,7 @@ sed "s/REPLACE_ME/${ROLLOUT_NODE_IP}/g" \
 ```
 
 **关键路径替换**：
-- `model_name` → `/dev/shm/models/DeepSeek-V4-Flash`
+- `model_name` → `/dev/shm/models/DeepSeek-V4-Flash-BF16`
 - `dataset` → `/dev/shm/datasets/dapo-math-17k/dapo-math-17k.jsonl`
 - `checkpoint_dir` → `/nfs/data/leiwu/ckpts/dsv4-flash-lumenrl/smoke`
 - `cluster.topology_tags.node_ip` → `10.194.132.76`
@@ -461,6 +512,127 @@ W&B project 固定为 `danyzhan-amd/LumenRL`。正式训练启动后先确认 W&
 再确认第一个 step 的 inference-side FP8 RDMA reload 和 R3 diagnostics；第 5 步必须验证
 NFS checkpoint 的 Megatron distributed-checkpoint shards、metadata 和恢复 step 完整。
 
+### 8.5 从 rank-local checkpoint 恢复大模型训练（2026-08-21）
+
+本节记录从 `global_step_25` 恢复 DSV4 正式训练的流程。mmap 原位加载和缓存释放已通过
+offline recovery gate；原 W&B run 的正式恢复仍在执行中。该 checkpoint 包含 16 个 rank
+的 model、optimizer、optimizer parameter state 和 extra state shard。
+
+#### A. 必需修复
+
+恢复前必须部署最新版 `examples/GRPO/dsv4/patch_rocm_megatron_dsv4.py`。补丁对
+DP=1 HybridDeviceOptimizer (HDO) 使用 `torch.load(..., mmap=True)`，并将 optimizer
+参数原位写回已有 storage，避免为每个 rank 额外创建数十 GiB、集群总计约
+600–700 GiB 的临时副本。运行时应看到：
+
+```text
+[LumenRL] loading DP=1 HDO checkpoint state in place
+```
+
+旧恢复路径还会对 Qwen3 MoE 的原生 FP32 参数查询
+`param_to_fp32_param`；这些参数不一定存在于映射中，可能导致部分 rank `KeyError`，
+其余 rank 永久阻塞在 distributed barrier。不要通过跳过 optimizer state 来规避该错误。
+
+部署后先运行相关回归测试，并确认三节点运行时代码 SHA256 一致：
+
+```bash
+python -m pytest \
+  tests/unit/test_patch_rocm_megatron_dsv4.py \
+  tests/unit/workers/test_actor_worker_engine_config.py \
+  tests/unit/engine/test_megatron_lumen_dsv4_engine.py \
+  -q
+```
+
+#### B. 恢复前检查与模型暂存
+
+1. 确认 checkpoint 的 16 个 rank shard 全部存在，不能只检查 `global_step_25` 目录。
+2. 三节点执行 `ray stop --force`，确认训练 GPU 无残留 context。
+3. 训练节点均需暂存完整 BF16 HF 模型；当前模型目录实际约 530 GiB：
+
+```bash
+du -sh /dev/shm/models/DeepSeek-V4-Flash-BF16
+free -h
+```
+
+模型初始化期间两个 trainer 必须保留各自的 `/dev/shm/models`。rollout 节点上的模型副本
+必须始终保留，后续 vLLM 仍需使用。
+
+#### C. 以 memory-safe 配置重建 Ray
+
+Ray 自身的 99% memory monitor 会在恢复峰值时提前杀死最后几个 rank，即使 Linux
+仍可回收 page cache。三节点启动 Ray 时设置：
+
+```bash
+export RAY_memory_monitor_refresh_ms=0
+export MALLOC_ARENA_MAX=2
+export LUMENRL_CHECKPOINT_FORMAT=rank_local
+```
+
+继续设置正确的 `GLOO_SOCKET_IFNAME`、`NCCL_SOCKET_IFNAME`、IB HCA/GID 和
+`RAY_TMPDIR`。重建后确认 3 个 alive nodes、24 GPUs。
+
+#### D. 在 engine 初始化后立即释放 trainer 模型缓存
+
+初始化完成且日志首次出现以下 marker 后：
+
+```text
+Resuming Ray actor checkpoint from .../global_step_25/actor (step=25).
+```
+
+表示 16 个 engine 已不再依赖 HF 模型目录。先用 `lsof +D` 确认没有打开的文件，再只在
+两个 trainer 删除模型缓存：
+
+```bash
+lsof +D /dev/shm/models/DeepSeek-V4-Flash-BF16
+rm -rf /dev/shm/models/DeepSeek-V4-Flash-BF16
+free -h
+```
+
+此操作可在每个 trainer 立即回收约 530 GiB，为 mmap optimizer restore 留出空间。
+删除得过早会破坏 engine 初始化；删除 rollout 节点副本会破坏 vLLM。建议用 watcher
+检测上述 marker 后自动执行，避免人工延迟造成 OOM。
+
+#### E. 启动恢复
+
+```bash
+export MODE=longrun STEPS=200
+export CKPT_DIR=/groupstorage/danyzhan/lumenrl_ckpts/dsv4-lockstep-formal-200-eval8-20260817
+export RESUME_OVERRIDE=true
+export LUMENRL_CHECKPOINT_FORMAT=rank_local
+export RAY_memory_monitor_refresh_ms=0
+export MALLOC_ARENA_MAX=2
+export LUMENRL_KEEP_RAY_CLUSTER=1
+
+bash examples/GRPO/run_grpo_dsv4.sh
+```
+
+`global_step_N` 使用 1-based checkpoint 语义；恢复 `global_step_25` 后内部 resume step
+为 25，下一条训练日志应为 step 26。成功标志为：
+
+```text
+Ray resume complete. Next training log will be global_step=26.
+```
+
+恢复期间持续检查两个 trainer 的 `free -h`、kernel OOM 日志和 16 个
+`LumenActorWorker.load_checkpoint` task。任一 rank 失败后都必须停止整个 Ray 集群，
+不能只重启失败 rank。
+
+#### F. 恢复原 W&B run
+
+若 W&B 账号未启用 rewind private preview，禁止设置
+`WANDB_RESUME_FROM=<run>?_step=25`，否则服务端返回 HTTP 400。继续原 run 时使用：
+
+```bash
+export WANDB_RUN_ID=d9ohd8vx
+export WANDB_RESUME=must
+unset WANDB_RESUME_FROM
+```
+
+这种模式不会删除原 run 中已经存在的 step 26–44 历史。训练状态仍从 checkpoint
+step 25 恢复，但 W&B 会在已有 history 后继续接受新指标；当前原 run 的新指标从
+step 45 起追加。若必须让图表严格回退到 step 25，只能先申请 W&B rewind 权限，或创建
+一个新 run。
+
 ## 9. Actor→Rollout FP8 权重同步
 
 ### 9.1 方案 A：Actor 端 FP8 量化（当前禁用）
@@ -541,6 +713,9 @@ weight_sync:
 | GPU OOM | 其他容器占用 GPU | `docker stop` 其他容器释放 GPU |
 | optimizer 初始化只差 64 MiB OOM，Actor 已退出但 `rocm-smi` 仍显示约 90% | 上一轮 Ray worker/ROCm context 未完全清理 | 三节点 `ray stop --force`，确认训练 GPU VRAM 全部回到 0%，重建集群 |
 | 初始化 optimizer 时 GPU OOM，即使没有残留进程 | DistributedOptimizer 先在 GPU 创建完整 FP32 master-weight clone，峰值超过 MI308X 容量 | 设置 `use_precision_aware_optimizer: true`，启用 full CPU offload、BF16 moments 和 streamed Adam |
+| rank-local HDO checkpoint 恢复时部分 rank `KeyError`，其余 rank 卡在 barrier | 原生 FP32 参数不在 `param_to_fp32_param`，且旧路径产生巨大的临时 optimizer 副本 | 部署 mmap DP=1 HDO 原位恢复 patch，设置 `LUMENRL_CHECKPOINT_FORMAT=rank_local` |
+| checkpoint 恢复末期 Ray 杀死 rank，主机尚未发生 kernel OOM | Ray 99% memory monitor 在 page cache 回收前主动终止 worker | 三节点设置 `RAY_memory_monitor_refresh_ms=0`，并在 engine 初始化后释放 trainer 的 HF 模型缓存 |
+| W&B 恢复报 `failed to rewind run` / HTTP 400 | 账号未启用 rewind private preview | 使用 `WANDB_RUN_ID=<原ID>`、`WANDB_RESUME=must` 并清除 `WANDB_RESUME_FROM`；接受旧 history 保留 |
 | trainer-side FP8 同步成功但 eval/rollout 变成 `Aime`、`0`、`n` 等重复输出 | pre-quantized FP8 weight/scale 数值或 loader 对应错误；manifest 校验不覆盖源/目标逐值 parity | 设置 `fp8_quantization_location: inference`；不要将 `manifest=checked` 当作数值正确 |
 | 怀疑 prefix cache 导致或修复 rollout fault | 当前通过配置实际为 `enable_prefix_caching: false`，没有“开启后修复”的 A/B 证据 | 保持 prefix cache 关闭、chunked prefill 开启；修改前必须运行固定 prompts + 32×8 A/B |
 | ranks 8–15 optimizer 初始化远慢于 ranks 0–7 | CPU offload 跨 NUMA page migration | 设置 `numa_affinity: true`，用 `taskset -pc <PID>` 验证 GPU 0–3/4–7 分别绑定 NUMA 0/1 |
@@ -560,8 +735,8 @@ weight_sync:
 
 | 镜像 | Docker Hub Tag | 用途 |
 |------|---------------|------|
-| `zhangdanyangamd/lumen-rl:dsv4-300x-actor260805` | trainer (含 Megatron patch + TileKernels + tilelang) | 训练节点 |
-| `zhangdanyangamd/lumen-rl:dsv4-300x-rollout260805` | rollout (vLLM + LumenRL) | 推理节点 |
+| `zhangdanyangamd/lumen-rl:dsv4-300x-train260813` | 可直接运行的 trainer 最终环境 | f293、f294 |
+| `zhangdanyangamd/lumen-rl:dsv4-300x-rollout260813` | 可直接运行的 rollout 最终环境 | f2b9 |
 
 Base image: `vllm/vllm-openai-rocm:v0.25.1` (Python 3.12, PyTorch 2.11)
 
