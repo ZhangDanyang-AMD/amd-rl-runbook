@@ -1,29 +1,427 @@
 # DeepSeek-V4-Flash 三节点 RL 部署 Runbook
 
 > Megatron 训练（TP4/PP4/EP4）+ vLLM FP8 rollout + RCCL/RoCE GPU Direct RDMA 权重同步
-> 硬件：3 节点 — 2 × 8 MI308X 训练 + 1 × 8 MI300X 推理
-> LumenRL：`origin/dev/dsv4-grpo`
-> 超参对齐 LMSYS MILES DSV4：https://www.lmsys.org/blog/2026-07-10-rocm-miles-dsv4/
+> 硬件：3 节点 — 2 × 8 MI308X 训练 + 1 × 8 MI308X 推理
+> LumenRL：`dev/dsv4-grpo`，已验证 revision `80b8a1f`
+> Lumen：`dev/dsv4-flash`，固定 revision `e2ab70944dfb3cbcd197a0f752e1269692b900f9`
 
-## 0. 2026-08-10 当前已验证状态
+## 0. 最终复现入口（下一个 Agent 从这里开始）
 
-- 训练节点为 p19-29 + **p22-05**，p20-29 不属于当前集群；p21-29 继续作为 rollout/Ray head。
-- v35 已完成一个完整的 32×8 GRPO step：256 条 rollout、old log-probs、forward/backward、
-  streamed Adam、568 GB 级权重同步和 30 条 AIME eval 均执行完毕。
-- Megatron 初始化 OOM 已通过 `use_precision_aware_optimizer: true` 解决。该模式避免在 GPU
-  上一次性克隆完整 FP32 master weights，再配合 full optimizer CPU offload、BF16 moments 和
-  256 MiB streamed-Adam staging，将训练峰值显存控制在约 75.8 GB/GPU。
-- rollout GPU memory fault 已消失。当前通过配置为
-  `enable_chunked_prefill: true`、`enable_prefix_caching: false`；
-  **没有证据表明开启 prefix cache 修复了问题**，正式配置仍应关闭 prefix cache，除非重新完成 A/B。
-- 独立权重同步 A/B（不执行 RL、backward 或 optimizer step）确认：
-  trainer-side FP8 pre-quantization 会使同步后的 vLLM 输出立即退化为重复的 `Aime`、`0`、`n`
-  等模式；inference-side online FP8 同步后输出保持连贯。因此正式训练必须设置
-  `fp8_quantization_location: inference`。
-- v38 200-step 长跑已启动：rollout log-probs、token IS、batch normalization、R3 全部开启；
-  checkpoint 每 5 步保存到共享 NFS，最多保留 2 份。
+本节是 2026-09 完成 Step 1–80 验证后整理的**唯一权威启动流程**。复现时先完整执行本节；
+后续章节保留实现原理、历史故障和恢复细节。若后续章节中的旧主机名、镜像 tag、路径或
+checkpoint 周期与本节冲突，以本节和当前
+`examples/GRPO/configs/grpo_dsv4_flash_vllm_longrun.yaml` 为准。
 
-## 1. 目标架构
+### 0.1 已验证拓扑
+
+| 角色 | SSH 主机 | Ray IP | 容器 | GPU |
+|---|---|---|---|---|
+| rollout / Ray head | `smc300x-ccs-aus-gpuc489.prov.aus.ccs.cpe.ice.amd.com` | `10.235.200.32` | `dsv4-rollout` | 8 × MI308X |
+| actor-0 | `smc300x-ccs-aus-gpuf293.prov.aus.ccs.cpe.ice.amd.com` | `10.235.200.172` | `dsv4-train` | 8 × MI308X |
+| actor-1 | `smc300x-ccs-aus-gpuf294.prov.aus.ccs.cpe.ice.amd.com` | `10.235.200.57` | `dsv4-train` | 8 × MI308X |
+
+固定网络参数：
+
+```bash
+export ROLLOUT_IP=10.235.200.32
+export ACTOR0_IP=10.235.200.172
+export ACTOR1_IP=10.235.200.57
+export RDMA_IFACE=ens50f0
+export RDMA_HCA=ionic_0
+export RDMA_GID_INDEX=1
+```
+
+这些值只适用于上表的 SMC 三节点。换机器时必须重新发现 Ray IP、RoCE interface、HCA 和
+GID，并同时更新 YAML、Ray 命令及启动环境；不能只改其中一处。
+
+### 0.2 代码与配置门禁
+
+三台机器必须使用相同代码。新环境建议直接从当前分支构建，不要在运行中的容器内手改文件：
+
+```bash
+export WORK_ROOT="${HOME}/dsv4-workspace"
+mkdir -p "$WORK_ROOT"
+cd "$WORK_ROOT"
+
+git clone --branch dev/dsv4-grpo \
+  https://github.com/ZhangDanyang-AMD/Lumen-RL.git
+git -C Lumen-RL checkout 80b8a1f
+
+git clone --branch dev/dsv4-flash \
+  https://github.com/ZhangDanyang-AMD/Lumen.git
+git -C Lumen checkout e2ab70944dfb3cbcd197a0f752e1269692b900f9
+
+git -C Lumen-RL rev-parse HEAD
+git -C Lumen rev-parse HEAD
+```
+
+### 0.3 构建镜像
+
+在 LumenRL 根目录构建两个 target。两类镜像必须来自同一个 build context 和同一 Lumen
+revision：
+
+```bash
+cd "$WORK_ROOT/Lumen-RL"
+
+docker build -f examples/GRPO/Dockerfile.dsv4 \
+  --target trainer \
+  --build-arg LUMEN_REF=e2ab70944dfb3cbcd197a0f752e1269692b900f9 \
+  -t dsv4-flash:trainer .
+
+docker build -f examples/GRPO/Dockerfile.dsv4 \
+  --target rollout \
+  --build-arg LUMEN_REF=e2ab70944dfb3cbcd197a0f752e1269692b900f9 \
+  -t dsv4-flash:rollout .
+```
+
+用刚构建的 trainer image 检查长跑配置，避免依赖宿主机 Python 包：
+
+```bash
+docker run --rm -i \
+  -v "$WORK_ROOT/Lumen-RL:/workspace/Lumen-RL" \
+  -w /workspace/Lumen-RL \
+  dsv4-flash:trainer python3 - <<'PY'
+from omegaconf import OmegaConf
+
+path = "examples/GRPO/configs/grpo_dsv4_flash_vllm_longrun.yaml"
+cfg = OmegaConf.load(path)
+
+assert cfg.cluster.num_nodes == 3
+assert cfg.controller.ray.actor.num_workers == 16
+assert cfg.controller.ray.actor.topology_tags.node_ips == "10.235.200.172,10.235.200.57"
+assert cfg.controller.ray.rollout.num_workers == 8
+assert cfg.controller.ray.rollout.topology_tags.node_ips == "10.235.200.32"
+assert cfg.weight_sync.backend == "rdma"
+assert cfg.weight_sync.fp8_quantization_location == "inference"
+assert cfg.weight_sync.rdma.interface == "ens50f0"
+assert cfg.weight_sync.rdma.hca == "ionic_0"
+assert cfg.weight_sync.rdma.gid_index == 1
+assert cfg.policy.training.megatron_cfg.tensor_model_parallel_size == 4
+assert cfg.policy.training.megatron_cfg.pipeline_model_parallel_size == 4
+assert cfg.policy.training.megatron_cfg.expert_model_parallel_size == 4
+assert cfg.policy.generation.vllm_cfg.tensor_parallel_size == 8
+assert cfg.policy.generation.vllm_cfg.gpu_memory_utilization == 0.90
+assert cfg.policy.generation.vllm_cfg.enable_prefix_caching is False
+print("DSV4 long-run config gate: OK")
+PY
+```
+
+将 trainer image 放到两个 actor 节点，将 rollout image 放到 Ray-head 节点。若通过 registry
+分发，三台机器先记录并核对 image ID：
+
+```bash
+docker image inspect dsv4-flash:trainer --format '{{.Id}}'
+docker image inspect dsv4-flash:rollout --format '{{.Id}}'
+```
+
+### 0.4 准备模型、数据和持久化目录
+
+本次运行使用的实际容器内路径：
+
+```text
+/dev/shm/models/DeepSeek-V4-Flash-BF16/
+/dev/shm/datasets/dapo-math-17k/dapo-math-17k.jsonl
+/dev/shm/datasets/aime-2024/aime-2024.jsonl
+/dev/shm/logs/
+/groupstorage/danyzhan/lumenrl_ckpts/dsv4-lockstep-formal-200-eval8-20260817/
+```
+
+模型和两个数据集必须在三台节点都存在，checkpoint 目录必须是三台节点可见的共享存储。
+不要把唯一 checkpoint 放在 `/dev/shm`。每台节点执行：
+
+```bash
+test -f /dev/shm/models/DeepSeek-V4-Flash-BF16/config.json
+test -f /dev/shm/datasets/dapo-math-17k/dapo-math-17k.jsonl
+test -f /dev/shm/datasets/aime-2024/aime-2024.jsonl
+mkdir -p /dev/shm/logs
+test -d /groupstorage/danyzhan/lumenrl_ckpts
+```
+
+若资产缺失，在**三台节点分别**执行以下幂等下载；`/dev/shm` 需至少保留约 600 GiB：
+
+```bash
+python3 -m venv "${HOME}/.cache/dsv4-hf-venv"
+"${HOME}/.cache/dsv4-hf-venv/bin/pip" install -U \
+  'huggingface_hub[hf_xet]'
+
+HF_XET_HIGH_PERFORMANCE=1 \
+"${HOME}/.cache/dsv4-hf-venv/bin/python" - <<'PY'
+from huggingface_hub import snapshot_download
+
+snapshot_download(
+    "RedHatAI/DeepSeek-V4-Flash-BF16",
+    local_dir="/dev/shm/models/DeepSeek-V4-Flash-BF16",
+    max_workers=16,
+)
+snapshot_download(
+    "zhuzilin/dapo-math-17k",
+    repo_type="dataset",
+    local_dir="/dev/shm/datasets/dapo-math-17k",
+    max_workers=8,
+)
+snapshot_download(
+    "zhuzilin/aime-2024",
+    repo_type="dataset",
+    local_dir="/dev/shm/datasets/aime-2024",
+    max_workers=8,
+)
+PY
+```
+
+### 0.5 启动容器
+
+在 rollout 节点执行：
+
+```bash
+sudo docker rm -f dsv4-rollout 2>/dev/null || true
+sudo docker run -d --name dsv4-rollout \
+  --privileged --network=host --ipc=host --shm-size=256g \
+  -v /dev/infiniband:/dev/infiniband \
+  -v /groupstorage:/groupstorage \
+  -v "$WORK_ROOT/Lumen-RL:/workspace/Lumen-RL" \
+  -v "$WORK_ROOT/Lumen:/workspace/Lumen" \
+  --entrypoint /bin/bash dsv4-flash:rollout -lc 'sleep infinity'
+```
+
+在两个 actor 节点分别执行：
+
+```bash
+sudo docker rm -f dsv4-train 2>/dev/null || true
+sudo docker run -d --name dsv4-train \
+  --privileged --network=host --ipc=host --shm-size=256g \
+  -v /dev/infiniband:/dev/infiniband \
+  -v /groupstorage:/groupstorage \
+  -v "$WORK_ROOT/Lumen-RL:/workspace/Lumen-RL" \
+  -v "$WORK_ROOT/Lumen:/workspace/Lumen" \
+  --entrypoint /bin/bash dsv4-flash:trainer -lc 'sleep infinity'
+```
+
+`--ipc=host` 让容器直接访问宿主机 `/dev/shm` 中的模型和数据；`--privileged` 与
+`/dev/infiniband` 用于当前集群的 GPU Direct RDMA。启动后检查：
+
+```bash
+sudo docker exec dsv4-train rocm-smi --showproductname
+sudo docker exec dsv4-train python3 -c \
+  'import lumen,lumenrl; print(lumen.__file__, lumenrl.__file__)'
+```
+
+### 0.6 每次运行前重建 Ray
+
+失败或重跑后必须停止三台节点的 Ray；不能只杀 driver。先分别执行：
+
+```bash
+sudo docker exec dsv4-rollout ray stop --force   # rollout 节点
+sudo docker exec dsv4-train ray stop --force     # 两个 actor 节点
+```
+
+在 rollout 节点启动 head：
+
+```bash
+sudo docker exec \
+  -e RAY_memory_usage_threshold=0.99 \
+  -e RAY_TMPDIR=/dev/shm/ray \
+  -e GLOO_SOCKET_IFNAME=ens50f0 \
+  -e NCCL_SOCKET_IFNAME=ens50f0 \
+  -e NCCL_IB_HCA=ionic_0 \
+  -e NCCL_IB_GID_INDEX=1 \
+  -e NCCL_DEBUG=WARN \
+  -e LUMENRL_CHECKPOINT_FORMAT=rank_local \
+  dsv4-rollout ray start --head \
+  --node-ip-address=10.235.200.32 --port=6379 \
+  --num-gpus=8 --num-cpus=224 \
+  --object-store-memory=200000000000 \
+  --min-worker-port=10002 --max-worker-port=19999 \
+  --dashboard-host=0.0.0.0 --disable-usage-stats
+```
+
+在 actor-0 节点加入集群：
+
+```bash
+sudo docker exec \
+  -e RAY_memory_usage_threshold=0.99 \
+  -e RAY_TMPDIR=/dev/shm/ray \
+  -e GLOO_SOCKET_IFNAME=ens50f0 \
+  -e NCCL_SOCKET_IFNAME=ens50f0 \
+  -e NCCL_IB_HCA=ionic_0 \
+  -e NCCL_IB_GID_INDEX=1 \
+  -e NCCL_DEBUG=WARN \
+  -e LUMENRL_CHECKPOINT_FORMAT=rank_local \
+  dsv4-train ray start \
+  --address=10.235.200.32:6379 \
+  --node-ip-address=10.235.200.172 \
+  --num-gpus=8 --num-cpus=224 \
+  --object-store-memory=200000000000 \
+  --min-worker-port=10002 --max-worker-port=19999 \
+  --disable-usage-stats
+```
+
+actor-1 使用完全相同的命令，只把 `--node-ip-address` 改为 `10.235.200.57`。
+
+在 rollout 节点验收资源：
+
+```bash
+sudo docker exec dsv4-rollout \
+  ray status --address=10.235.200.32:6379
+```
+
+必须看到 3 个 alive nodes、24 GPUs、无 pending node。后续 driver 必须显式传
+`RAY_ADDRESS=10.235.200.32:6379`；省略它会让 driver 误建本地 Ray，导致两个 actor 节点
+无法调度。
+
+### 0.7 三步 smoke test
+
+从 rollout 节点启动。先使用 long-run YAML 跑 3 步，覆盖 actor update、R3、RDMA reload、
+AIME evaluation 和 checkpoint 路径：
+
+```bash
+sudo docker exec -d \
+  -e RAY_ADDRESS=10.235.200.32:6379 \
+  -e RAY_TMPDIR=/dev/shm/ray \
+  -e RL_ROOT=/workspace \
+  -e DATA_ROOT=/dev/shm \
+  -e MODE=longrun \
+  -e STEPS=3 \
+  -e CONFIG_OVERRIDE=/workspace/Lumen-RL/examples/GRPO/configs/grpo_dsv4_flash_vllm_longrun.yaml \
+  -e MODEL_PATH=/dev/shm/models/DeepSeek-V4-Flash-BF16 \
+  -e TRAIN_FILE=/dev/shm/datasets/dapo-math-17k/dapo-math-17k.jsonl \
+  -e VAL_FILE=/dev/shm/datasets/aime-2024/aime-2024.jsonl \
+  -e LOG=/dev/shm/logs/dsv4-smoke.log \
+  -e CKPT_DIR=/groupstorage/danyzhan/lumenrl_ckpts/dsv4-smoke \
+  -e RUN_ID=dsv4-smoke \
+  -e WANDB_MODE=offline \
+  -e RESUME_OVERRIDE=false \
+  -e CHECKPOINT_SAVE_STEPS=3 \
+  -e CHECKPOINT_SAVE_TOTAL_LIMIT=1 \
+  -e WEIGHT_SYNC_BACKEND=rdma \
+  -e FP8_QUANTIZATION_LOCATION=inference \
+  -e LUMENRL_KEEP_RAY_CLUSTER=1 \
+  -e LUMENRL_CHECKPOINT_FORMAT=rank_local \
+  -e GLOO_SOCKET_IFNAME=ens50f0 \
+  -e NCCL_SOCKET_IFNAME=ens50f0 \
+  -e NCCL_IB_HCA=ionic_0 \
+  -e NCCL_IB_GID_INDEX=1 \
+  dsv4-rollout bash /workspace/Lumen-RL/examples/GRPO/run_grpo_dsv4.sh
+```
+
+检查 driver 和日志：
+
+```bash
+sudo docker exec dsv4-rollout pgrep -af lumenrl.trainer.main
+sudo docker exec dsv4-rollout \
+  python3 -c "from pathlib import Path; print(Path('/dev/shm/logs/dsv4-smoke.log').read_text()[-12000:])"
+```
+
+通过条件：
+
+- 进程最终 `exit=0`，Step 1–3 均完成；
+- 16 个 actor worker 分布在两个指定 actor 节点，8 个 rollout worker 位于 head 节点；
+- `fp8_quantization_location=inference`，每步完成 BF16→FP8 online reload；
+- RDMA full-load verification 通过，无 socket fallback、collective timeout 或 tensor mismatch；
+- R3 route coverage 完整，无 missing/duplicate PP layer；
+- Step 3 checkpoint 目录包含 16 个 actor rank shard 和 metadata。
+
+### 0.8 启动可复现的 80-step 运行
+
+smoke 通过后先按 0.6 重建一次干净 Ray，再从 rollout 节点启动：
+
+```bash
+export RUN_NAME=dsv4-flash-grpo-80step-$(date +%Y%m%d-%H%M%S)
+export CKPT_DIR=/groupstorage/danyzhan/lumenrl_ckpts/$RUN_NAME
+export LOG=/dev/shm/logs/$RUN_NAME.log
+
+sudo docker exec -d \
+  -e RAY_ADDRESS=10.235.200.32:6379 \
+  -e RAY_TMPDIR=/dev/shm/ray \
+  -e RL_ROOT=/workspace \
+  -e DATA_ROOT=/dev/shm \
+  -e MODE=longrun \
+  -e STEPS=80 \
+  -e CONFIG_OVERRIDE=/workspace/Lumen-RL/examples/GRPO/configs/grpo_dsv4_flash_vllm_longrun.yaml \
+  -e MODEL_PATH=/dev/shm/models/DeepSeek-V4-Flash-BF16 \
+  -e TRAIN_FILE=/dev/shm/datasets/dapo-math-17k/dapo-math-17k.jsonl \
+  -e VAL_FILE=/dev/shm/datasets/aime-2024/aime-2024.jsonl \
+  -e LOG="$LOG" \
+  -e CKPT_DIR="$CKPT_DIR" \
+  -e RUN_ID="$RUN_NAME" \
+  -e WANDB_RUN_NAME="$RUN_NAME" \
+  -e RESUME_OVERRIDE=false \
+  -e CHECKPOINT_SAVE_STEPS=25 \
+  -e CHECKPOINT_SAVE_TOTAL_LIMIT=2 \
+  -e WEIGHT_SYNC_BACKEND=rdma \
+  -e FP8_QUANTIZATION_LOCATION=inference \
+  -e LUMENRL_KEEP_RAY_CLUSTER=1 \
+  -e LUMENRL_CHECKPOINT_FORMAT=rank_local \
+  -e GLOO_SOCKET_IFNAME=ens50f0 \
+  -e NCCL_SOCKET_IFNAME=ens50f0 \
+  -e NCCL_IB_HCA=ionic_0 \
+  -e NCCL_IB_GID_INDEX=1 \
+  -e NCCL_DEBUG=WARN \
+  -e NCCL_DEBUG_SUBSYS=COLL,NET \
+  -e TORCH_NCCL_TRACE_BUFFER_SIZE=200000 \
+  -e TORCH_NCCL_DUMP_ON_TIMEOUT=1 \
+  -e TORCH_NCCL_DESYNC_DEBUG=1 \
+  -e TORCH_NCCL_ENABLE_TIMING=1 \
+  dsv4-rollout bash /workspace/Lumen-RL/examples/GRPO/run_grpo_dsv4.sh
+```
+
+如果启用 W&B，把 `WANDB_API_KEY=<key>` 写到 rollout 节点的
+`$WORK_ROOT/wandb.key`（权限 `0600`），再执行
+`sudo docker cp "$WORK_ROOT/wandb.key" dsv4-rollout:/workspace/wandb.key`；禁止把 key
+写入 runbook 或提交到 Git。若不使用 W&B，在 0.8 命令中增加
+`-e WANDB_MODE=offline`。
+
+### 0.9 从 Step 50 checkpoint 恢复到 Step 80
+
+恢复前确认共享目录中 Step 50 的 16 个 rank-local shard 完整，然后停止 driver、三节点
+`ray stop --force`、确认 GPU context 已释放，并按 0.6 重建 Ray。使用与原运行完全相同的
+`RUN_NAME`、`CKPT_DIR`、模型、数据和 YAML，仅修改：
+
+```bash
+export RESUME_OVERRIDE=true
+export LUMENRL_CHECKPOINT_FORMAT=rank_local
+```
+
+启动命令沿用 0.8，并把 `-e RESUME_OVERRIDE=false` 改为
+`-e RESUME_OVERRIDE=true`。成功日志必须包含：
+
+```text
+Resuming Ray actor checkpoint from .../global_step_50/actor (step=50).
+Ray resume complete. Next training log will be global_step=51.
+```
+
+若恢复到原 W&B run，设置 `WANDB_RUN_ID=<原 run id>` 与 `WANDB_RESUME=must`。只有在
+W&B 已有历史恰好停在 Step 50 时才可直接 resume；若 W&B 已包含 Step 51 之后的数据，
+应创建新 run，或在账号明确支持 rewind 时先备份并执行 rewind，不能静默覆盖历史。
+
+### 0.10 运行期验收与交接
+
+每次接手先记录：
+
+```bash
+sudo docker exec dsv4-rollout \
+  ray status --address=10.235.200.32:6379
+sudo docker exec dsv4-rollout pgrep -af lumenrl.trainer.main
+sudo docker exec dsv4-rollout \
+  python3 -c "from pathlib import Path; p=Path('$LOG'); print(p.stat()); print(p.read_text()[-12000:])"
+```
+
+健康运行应满足：
+
+- Ray 始终保持 3 个 alive nodes / 24 GPUs；
+- rollout 节点只运行 TP8 inference，两个 actor 节点各放置 8 个 Megatron worker；
+- 无 `Traceback`、`RayTaskError`、worker died、metadata mismatch、RCCL timeout；
+- 每步完成 rollout、reward、BF16 rescoring、GRPO update 和 RDMA reload；
+- 每 5 步完成 AIME-2024 evaluation，每 25 步保存 checkpoint；
+- rollout throughput 稳定在本次验证的约 287–331 generated tokens/s 区间；
+- checkpoint 后实际检查 16 个 rank shard，而不是只检查 `global_step_N` 目录存在。
+
+任何 actor 或 RDMA rank 失败后都停止整个 driver 和三节点 Ray，确认两个 actor 节点
+VRAM 归零，再从最后一个完整 checkpoint 恢复。不要只重启单个 rank。
+
+## 1. 技术背景与历史记录（非启动入口）
+
+> 本节至文末包含早期 Banff 部署的实现说明、故障记录和旧命令。它们用于解释设计与排障，
+> 不是当前 SMC 三节点的复制粘贴入口。新复现必须执行第 0 节。
 
 ### 1.1 节点角色
 
@@ -134,7 +532,7 @@ PY
 
 **注意**：`/dev/shm` 是 tmpfs（内存），节点重启后丢失。`--ipc=host` 的 Docker 容器共享宿主机 `/dev/shm`。
 
-## 3. Docker 镜像
+## 3. 历史 Docker 镜像（归档）
 
 ### 3.1 最终镜像和节点分配
 
@@ -254,7 +652,7 @@ DSV4 的 HuggingFace `config.json` 字段名和 Megatron/Lumen 不同：
 | `index_head_dim` | dsa_indexer_head_dim | 128 |
 | `index_topk` | dsa_indexer_topk | 512 |
 
-## 6. Ray 集群
+## 6. 历史 Ray 集群记录（归档）
 
 ### 6.1 启动
 
@@ -343,7 +741,7 @@ snapshot_download('zhuzilin/aime-2024', repo_type='dataset', local_dir='/dev/shm
 "
 ```
 
-## 8. 启动训练
+## 8. 历史启动与恢复记录（归档）
 
 ### 8.1 生成部署 YAML
 
@@ -729,7 +1127,7 @@ weight_sync:
 | vLLM entrypoint 冲突 | vLLM base image 默认入口 | `--entrypoint bash` 覆盖 |
 | Python 版本不匹配 | 训练/推理容器 Python 不一致 | 统一使用 `vllm/vllm-openai-rocm:v0.25.1` base |
 
-## 11. 软件版本与代码仓库
+## 11. 历史软件版本与代码仓库（归档）
 
 ### 11.1 Docker 镜像
 
