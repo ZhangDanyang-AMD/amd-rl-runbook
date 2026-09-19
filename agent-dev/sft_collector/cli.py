@@ -56,6 +56,18 @@ def main(argv=None):
         "--workspace-dir", default="",
         help="Workspace directory for OPUS verification",
     )
+    p_off.add_argument(
+        "--cap-analysis", type=int, default=200,
+        help="Stop collecting analysis_trajectory after this many (default: 200)",
+    )
+    p_off.add_argument(
+        "--cap-opus", type=int, default=400,
+        help="Stop collecting opus_kernel after this many (default: 400)",
+    )
+    p_off.add_argument(
+        "--cap-concept", type=int, default=400,
+        help="Stop collecting concept_snapshot after this many (default: 400)",
+    )
 
     # ---- online ----
     p_on = sub.add_parser("online", help="Start online middleware (standalone test mode)")
@@ -123,6 +135,9 @@ def _cmd_offline(args: argparse.Namespace) -> int:
         harness_config=harness_config,
         workspace_dir=args.workspace_dir,
         skip_verify=args.skip_verify,
+        cap_analysis=args.cap_analysis,
+        cap_opus=args.cap_opus,
+        cap_concept=args.cap_concept,
     )
 
     agent = OfflineAgent(run_dir=args.run_dir, config=config)
