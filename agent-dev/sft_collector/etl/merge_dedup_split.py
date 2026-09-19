@@ -52,7 +52,11 @@ def merge_runs(run_dirs: List[str], output_dir: str) -> List[Dict[str, Any]]:
 
             # SHA256 integrity check
             actual_sha = hashlib.sha256(content.encode()).hexdigest()
-            expected_sha = manifest_entries.get(sample_id, actual_sha)
+            expected_sha = manifest_entries.get(sample_id)
+            if expected_sha is None:
+                logger.error("Missing manifest entry for %s, skipping", sample_id)
+                integrity_errors += 1
+                continue
             if actual_sha != expected_sha:
                 logger.error(
                     "SHA256 mismatch for %s: expected %s, got %s",

@@ -198,6 +198,8 @@ def _cmd_etl(args: argparse.Namespace) -> int:
 def _cmd_verify(args: argparse.Namespace) -> int:
     """Batch verify pending samples."""
     import os
+    import subprocess
+    import tempfile
     from .core.independent_verifier import IndependentVerifier
     from .core.schema import VerifyStatus
 
@@ -221,6 +223,7 @@ def _cmd_verify(args: argparse.Namespace) -> int:
 
     passed = 0
     failed = 0
+    skipped = 0
     for fname in files:
         fpath = os.path.join(pending_dir, fname)
         with open(fpath) as f:
@@ -229,26 +232,59 @@ def _cmd_verify(args: argparse.Namespace) -> int:
         parent = sample.get("input", {}).get("parent_source", "")
         patch = sample.get("output", {}).get("patch", "")
         if not parent or not patch:
+            skipped += 1
+            continue
+
+        candidate = _reconstruct_candidate(parent, patch)
+        if candidate is None:
+            dest = os.path.join(rejected_dir, fname)
+            os.rename(fpath, dest)
+            failed += 1
             continue
 
         ws_config = {"workspace_dir": args.workspace_dir}
         receipt = verifier.verify(
-            parent, "", patch, ws_config, args.run_dir, sample.get("sample_id", fname)
+            parent, candidate, patch, ws_config, args.run_dir,
+            sample.get("sample_id", fname),
         )
 
         if receipt.status == VerifyStatus.PASSED:
-            # Move to samples/
             dest = os.path.join(samples_dir, fname)
             os.rename(fpath, dest)
             passed += 1
         else:
-            # Move to rejected/
             dest = os.path.join(rejected_dir, fname)
             os.rename(fpath, dest)
             failed += 1
 
-    print(f"Verified: {passed} passed, {failed} failed")
+    print(f"Verified: {passed} passed, {failed} failed, {skipped} skipped")
     return 0
+
+
+def _reconstruct_candidate(parent: str, patch: str):
+    # type: (str, str) -> Optional[str]
+    """Apply patch to parent source to reconstruct the candidate."""
+    import subprocess
+    import tempfile
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            import os
+            src = os.path.join(tmpdir, "source.opus")
+            with open(src, "w") as f:
+                f.write(parent)
+            patch_file = os.path.join(tmpdir, "diff.patch")
+            with open(patch_file, "w") as f:
+                f.write(patch)
+            result = subprocess.run(
+                ["patch", "-p1", "--forward", "-i", patch_file],
+                capture_output=True, text=True, cwd=tmpdir, timeout=30,
+            )
+            if result.returncode != 0:
+                return None
+            with open(src) as f:
+                return f.read()
+    except Exception:
+        return None
 
 
 if __name__ == "__main__":

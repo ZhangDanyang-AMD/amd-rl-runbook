@@ -51,6 +51,8 @@ class EventKind(str, enum.Enum):
     PRESENT = "present"
     SESSION_START = "session_start"
     SESSION_END = "session_end"
+    FILE_READ = "file_read"
+    FILE_WRITE = "file_write"
 
 
 @dataclass

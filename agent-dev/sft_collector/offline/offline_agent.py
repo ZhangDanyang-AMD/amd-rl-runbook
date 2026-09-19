@@ -291,14 +291,15 @@ class OfflineAgent:
 
         gate_common = check_common(sample)
         gate_opus = check_opus_kernel(sample, verify_receipt, skip_verify=self.config.skip_verify)
+        gate_fields = check_field_completeness(sample) if not self.config.skip_verify else GateResult(True, [])
 
         if verify_receipt and verify_receipt.status == VerifyStatus.PENDING:
             self.writer.write_pending(sample)
             self.quota.record("pending")
             return result
 
-        if not gate_common or not gate_opus:
-            reasons = gate_common.reasons + gate_opus.reasons
+        if not gate_common or not gate_opus or not gate_fields:
+            reasons = gate_common.reasons + gate_opus.reasons + gate_fields.reasons
             self.writer.write_rejected(sample, reasons)
             self.quota.record("rejected")
             result["reject"] = 1
@@ -326,9 +327,11 @@ class OfflineAgent:
             context=ctx_snap,
         )
 
+        gate_common = check_common(sample)
         gate = check_concept_snapshot(sample, self._concept_hashes)
-        if not gate:
-            self.writer.write_rejected(sample, gate.reasons)
+        if not gate_common or not gate:
+            reasons = gate_common.reasons + gate.reasons
+            self.writer.write_rejected(sample, reasons)
             self.quota.record("rejected")
             return 0
 

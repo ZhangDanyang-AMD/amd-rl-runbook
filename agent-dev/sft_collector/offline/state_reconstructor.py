@@ -19,6 +19,10 @@ _WRITE_CMD_PAT = re.compile(
     r"(?:cat\s*>|tee\s|echo\s.*>|write_file|>\s*)(.+?\.(?:opus|hpp))",
     re.IGNORECASE,
 )
+_HEREDOC_PAT = re.compile(
+    r"<<\s*['\"]?(\w+)['\"]?\s*\n(.*?)\n\1",
+    re.DOTALL,
+)
 
 
 class StateReconstructor:
@@ -75,6 +79,19 @@ class StateReconstructor:
             if text:
                 self.context.on_reasoning_block(text)
 
+        elif ev.kind == EventKind.FILE_READ:
+            path = ev.data.get("path", "")
+            content = ev.data.get("content", "")
+            if path and content:
+                self.shadow.on_file_read(path, content)
+                self.context.on_tool_result("read", path, content)
+
+        elif ev.kind == EventKind.FILE_WRITE:
+            path = ev.data.get("path", "")
+            content = ev.data.get("content", "")
+            if path and content:
+                self.shadow.on_file_write(path, content)
+
         elif ev.kind == EventKind.INBOX:
             sender = ev.data.get("sender", "")
             text = ev.data.get("text", "")
@@ -101,6 +118,9 @@ class StateReconstructor:
             m = _WRITE_CMD_PAT.search(cmd)
             if m:
                 ev.data["_opus_write_path"] = m.group(1).strip()
+                hd = _HEREDOC_PAT.search(cmd)
+                if hd:
+                    ev.data["_opus_write_content"] = hd.group(2)
 
     def _on_tool_result(self, ev: Event) -> None:
         content = ev.data.get("content", "")
@@ -123,10 +143,13 @@ class StateReconstructor:
             # Generic tool result processing for context accumulation
             self.context.on_tool_result("", "", content)
 
-        # Detect file write results
+        # Detect file write results — use extracted heredoc content if available,
+        # skip if only shell stdout (unreliable for file writes)
         write_path = ev.data.get("_opus_write_path", "")
         if write_path:
-            self.shadow.on_file_write(write_path, content)
+            write_content = ev.data.get("_opus_write_content", "")
+            if write_content:
+                self.shadow.on_file_write(write_path, write_content)
 
         # Detect compile/correctness failures for error-recovery
         if self.shadow.error_recovery_mode:
@@ -147,6 +170,7 @@ def correlate_tool_calls_results(events: List[Event]) -> List[Event]:
     result = list(events)
     pending_read_path: Optional[str] = None
     pending_write_path: Optional[str] = None
+    pending_write_content: Optional[str] = None
     pending_tool_name: Optional[str] = None
 
     for i, ev in enumerate(result):
@@ -162,27 +186,35 @@ def correlate_tool_calls_results(events: List[Event]) -> List[Event]:
                 else:
                     pending_read_path = None
                 pending_write_path = None
+                pending_write_content = None
             elif name in ("pwsh", "bash", "shell"):
                 cmd = args.get("command", args.get("cmd", ""))
                 m = _WRITE_CMD_PAT.search(cmd)
                 if m:
                     pending_write_path = m.group(1).strip()
+                    hd = _HEREDOC_PAT.search(cmd)
+                    pending_write_content = hd.group(2) if hd else None
                 else:
                     pending_write_path = None
+                    pending_write_content = None
                 pending_read_path = None
             else:
                 pending_read_path = None
                 pending_write_path = None
+                pending_write_content = None
 
         elif ev.kind == EventKind.TOOL_RESULT:
             if pending_read_path:
                 ev.data["_opus_read_path"] = pending_read_path
             if pending_write_path:
                 ev.data["_opus_write_path"] = pending_write_path
+            if pending_write_content is not None:
+                ev.data["_opus_write_content"] = pending_write_content
             if pending_tool_name:
                 ev.data["_from_tool"] = pending_tool_name
             pending_read_path = None
             pending_write_path = None
+            pending_write_content = None
             pending_tool_name = None
 
     return result

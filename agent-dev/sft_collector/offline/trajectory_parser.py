@@ -41,6 +41,8 @@ _TYPE_MAP: Dict[str, EventKind] = {
     "present": EventKind.PRESENT,
     "session_start": EventKind.SESSION_START,
     "session_end": EventKind.SESSION_END,
+    "file_read": EventKind.FILE_READ,
+    "file_write": EventKind.FILE_WRITE,
 }
 
 
@@ -191,6 +193,9 @@ def _extract_data(raw: Dict[str, Any], kind: EventKind) -> Dict[str, Any]:
     if kind == EventKind.PRESENT:
         return {"deliverable": raw.get("deliverable", raw.get("content", ""))}
 
+    if kind in (EventKind.FILE_READ, EventKind.FILE_WRITE):
+        return {"path": raw.get("path", ""), "content": raw.get("content", "")}
+
     return raw
 
 
@@ -244,6 +249,8 @@ def find_trajectory_files(directory: str) -> List[str]:
     Accepts any .jsonl file — session*.jsonl, trajectory*.jsonl,
     online_buffer_*.jsonl, or other naming conventions.
     """
+    if os.path.isfile(directory):
+        return [directory] if directory.endswith(".jsonl") else []
     results: List[str] = []
     for root, dirs, files in os.walk(directory):
         for fname in files:

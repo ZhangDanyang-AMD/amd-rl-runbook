@@ -170,6 +170,10 @@ class IndependentVerifier:
             receipt.cheating_checks = self._run_cheating_checks(
                 fresh_ws, workspace_config, candidate_source
             )
+            if any(receipt.cheating_checks.values()):
+                receipt.status = VerifyStatus.FAILED
+                self._save_receipt(verify_dir, receipt)
+                return receipt
 
             receipt.status = VerifyStatus.PASSED
             self._save_receipt(verify_dir, receipt)

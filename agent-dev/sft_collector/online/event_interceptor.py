@@ -19,6 +19,10 @@ _WRITE_CMD_PAT = re.compile(
     r"(?:cat\s*>|tee\s|echo\s.*>|write_file|>\s*)(.+?\.(?:opus|hpp))",
     re.IGNORECASE,
 )
+_HEREDOC_PAT = re.compile(
+    r"<<\s*['\"]?(\w+)['\"]?\s*\n(.*?)\n\1",
+    re.DOTALL,
+)
 
 
 class EventInterceptor:
@@ -43,6 +47,7 @@ class EventInterceptor:
 
         self._pending_opus_write = None   # type: Optional[str]
         self._pending_read_path = None    # type: Optional[str]
+        self._pending_write_content = None  # type: Optional[str]
 
     def register(self, harness):
         # type: (Any) -> None
@@ -111,6 +116,8 @@ class EventInterceptor:
                     m = _WRITE_CMD_PAT.search(cmd)
                     if m:
                         self._pending_opus_write = m.group(1).strip()
+                        hd = _HEREDOC_PAT.search(cmd)
+                        self._pending_write_content = hd.group(2) if hd else None
 
             if self.on_tool_call_cb:
                 self.on_tool_call_cb(name, args, data)
@@ -130,11 +137,13 @@ class EventInterceptor:
                 self._pending_read_path = None
 
             if self._pending_opus_write:
+                write_content = self._pending_write_content if self._pending_write_content else content
                 if self.on_file_write_cb:
-                    self.on_file_write_cb(self._pending_opus_write, content)
+                    self.on_file_write_cb(self._pending_opus_write, write_content)
                 if self.on_opus_trigger:
                     self.on_opus_trigger(self._pending_opus_write)
                 self._pending_opus_write = None
+                self._pending_write_content = None
 
             if self.on_tool_result_cb:
                 self.on_tool_result_cb(content, data)

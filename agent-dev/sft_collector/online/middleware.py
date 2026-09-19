@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 MAX_CONTENT_BYTES = 50 * 1024    # truncate individual content fields to 50 KB
+MAX_SOURCE_BYTES = 512 * 1024    # source files get a higher limit (512 KB)
 MAX_EVENTS = 100000              # drop events beyond this count
 
 
@@ -127,7 +128,7 @@ class SFTCollectorMiddleware:
         try:
             self._append("file_read", {
                 "path": path,
-                "content": _truncate(content),
+                "content": _truncate(content, MAX_SOURCE_BYTES),
             })
         except Exception:
             pass
@@ -137,7 +138,7 @@ class SFTCollectorMiddleware:
         try:
             self._append("file_write", {
                 "path": path,
-                "content": _truncate(content),
+                "content": _truncate(content, MAX_SOURCE_BYTES),
             })
         except Exception:
             pass
@@ -251,10 +252,10 @@ class SFTCollectorMiddleware:
         return totals
 
 
-def _truncate(text):
-    # type: (str) -> str
+def _truncate(text, limit=MAX_CONTENT_BYTES):
+    # type: (str, int) -> str
     if not isinstance(text, str):
         text = str(text)
-    if len(text) > MAX_CONTENT_BYTES:
-        return text[:MAX_CONTENT_BYTES] + "\n... [truncated, {} bytes total]".format(len(text))
+    if len(text) > limit:
+        return text[:limit] + "\n... [truncated, {} bytes total]".format(len(text))
     return text
